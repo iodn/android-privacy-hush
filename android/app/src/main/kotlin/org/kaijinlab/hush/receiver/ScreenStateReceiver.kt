@@ -1,0 +1,157 @@
+package org.kaijinlab.hush.receiver
+
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import androidx.work.ExistingWorkPolicy
+import org.kaijinlab.hush.util.DualLogger
+import org.kaijinlab.hush.util.PendingLockWork
+import org.kaijinlab.hush.worker.PrivacyActionWorker
+import org.kaijinlab.hush.util.PrivacyActionWork
+import org.kaijinlab.hush.util.isDeviceSecurelyLocked
+
+class ScreenStateReceiver : BroadcastReceiver() {
+
+    // A receiver gets its Context per delivery rather than holding one, so the logger is built
+    // per call here instead of once per instance like the other users of DualLogger.
+    private fun logDebug(context: Context, message: String) = DualLogger(context, TAG).i(message)
+
+    private fun logWarning(context: Context, message: String) = DualLogger(context, TAG).w(message)
+
+    private fun logError(context: Context, message: String, e: Exception? = null) =
+        DualLogger(context, TAG).e(message, e)
+
+    override fun onReceive(context: Context, intent: Intent) {
+        logDebug(context, "Screen state changed: ${intent.action}")
+
+        when (intent.action) {
+            Intent.ACTION_SCREEN_OFF -> {
+                // Recorded as close to the real trigger event as possible, before the enqueue
+                // this branch leads to - the lock-side twin of recordUnlock() below, same
+                // reasoning: a plain volatile write can never interrupt anything mid-flight, so
+                // it needs no guard, and doWork() itself cannot be trusted to stamp this promptly
+                // enough (real WorkManager dispatch latency, outside doWork()'s own control, sits
+                // between this line and doWork() actually starting).
+                PendingLockWork.recordLock(context)
+                if (!isDeviceSecurelyLocked(context, TAG)) {
+                    logDebug(context, "✅ Screen OFF but device NOT locked yet - triggering privacy actions")
+                    triggerPrivacyAction(context, isLocking = true, isDeviceLocked = false, reason = "Screen Off (Unlocked)")
+                } else {
+                    logWarning(context, "⚠️ Screen OFF and device ALREADY locked - Android refuses camera/mic sensor privacy changes now")
+                    triggerPrivacyAction(context, isLocking = true, isDeviceLocked = true, reason = "Screen Off (Locked)")
+                }
+            }
+
+            Intent.ACTION_USER_PRESENT -> {
+                logDebug(context, "🔓 Screen UNLOCKED (user authenticated) - triggering privacy actions")
+                // Record the unlock unconditionally, before anything else - even when the cancel
+                // below is skipped, so a lock cycle that could not safely be cancelled at this
+                // moment still finds out about this unlock at its own later checkpoint. A plain
+                // timestamp write cannot interrupt anything mid-flight, so it needs none of the
+                // guard the cancel itself needs.
+                PendingLockWork.recordUnlock(context)
+                // Cancel any still-pending lock-side work. Unlike ACTION_SCREEN_ON, this
+                // broadcast has no "still locked" ambiguity to guard against - Android only
+                // sends it on a genuine, confirmed unlock - so whatever the lock delay was
+                // waiting to disable should never fire after this. Without this, a pending
+                // disable only gets caught later by accident (the post-delay re-checks further
+                // down this same file), which a lockDelay of 0 skips entirely, and which never
+                // covers the camera/mic path, which runs with no delay at all.
+                // Skipped only while a sensor disable is actively in flight - cancelling that
+                // would interrupt it mid-command with sensors left on and no error shown
+                // anywhere, the same race the other producers already guard against before
+                // they'd REPLACE this same unique work.
+                if (!PrivacyActionWorker.sensorDisableInProgress) {
+                    PendingLockWork.cancel(context, TAG, WORK_NAME_LOCK)
+                }
+                triggerPrivacyAction(context, isLocking = false, isDeviceLocked = false, reason = "Screen Unlock")
+            }
+
+            Intent.ACTION_SCREEN_ON -> {
+                // Only cancel the pending lock work if the phone is genuinely back in
+                // use (no keyguard, or none configured). A screen that merely wakes
+                // while still locked - a notification, raise-to-wake, a glance at the
+                // lock screen - is not a real return to use, and used to cancel the
+                // whole pending disable outright even though the phone was still
+                // locked the entire time. On an already-locked phone the lock delay
+                // is now always honoured, so this blip window is easier to hit than
+                // when the already-locked case used to skip the wait.
+                val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                // An unreadable lock state counts as still locked, so protection is not cancelled on a guess.
+                val isStillLocked = keyguardManager?.isKeyguardLocked ?: true
+
+                if (isStillLocked) {
+                    logDebug(context, "💡 Screen turned ON but still locked - keeping pending lock work")
+                } else {
+                    logDebug(context, "💡 Screen turned ON and not locked - cancelling pending lock work")
+                    // Recorded unconditionally, same reason as ACTION_USER_PRESENT above - this
+                    // branch only reaches here once isStillLocked is already confirmed false, so
+                    // it is always a genuine unlock signal.
+                    PendingLockWork.recordUnlock(context)
+                    // Guarded the same way ACTION_USER_PRESENT above, PrivacyAccessibilityService
+                    // and PrivacyMonitorService's restart catch-up all guard their own cancel: a
+                    // screen-on this fast could in principle land while this same lock cycle's own
+                    // sensor block is still running, and cancelUniqueWork() can interrupt a
+                    // running coroutine worker the same way an ExistingWorkPolicy.REPLACE can.
+                    if (!PrivacyActionWorker.sensorDisableInProgress) {
+                        PendingLockWork.cancel(context, TAG, WORK_NAME_LOCK)
+                    }
+                    // This branch re-enables, not only cancels, same as the app's other 3
+                    // unlock-detection paths - proven by ScreenStateReceiverTest's "ACTION_SCREEN_ON
+                    // while not locked..." test, which failed when this branch had no re-enable
+                    // call at all and passes now that it does. It exists for screen off during
+                    // Android's pre-keyguard grace period then back on before the keyguard
+                    // engages, where ACTION_USER_PRESENT never fires either.
+                    triggerPrivacyAction(context, isLocking = false, isDeviceLocked = false, reason = "Screen On (Not Locked)")
+                }
+            }
+
+            else -> {
+                logWarning(context, "⚠️ Unexpected intent action: ${intent.action}")
+            }
+        }
+    }
+    
+    private fun triggerPrivacyAction(context: Context, isLocking: Boolean, isDeviceLocked: Boolean, reason: String) {
+        // If the accessibility-triggered path is mid-way through disabling the camera/mic for
+        // THIS same lock, don't REPLACE it - that would cancel a disable that's already running,
+        // silently, with sensors left on. The regular-features delay this trigger would otherwise
+        // start still gets a chance to run once the in-flight worker completes, since that worker
+        // (enqueued with isDeviceLocked=false at the time) carries its own delay through to the
+        // same regular-features step.
+        if (isLocking && PrivacyActionWorker.sensorDisableInProgress) {
+            logDebug(context, "⏳ Sensor disable already in progress - not replacing it (reason: $reason)")
+            return
+        }
+        // The enable-side twin of the guard above: without it, a 3rd unlock signal
+        // REPLACE-enqueuing while a 2nd is still mid-way through enabling camera/mic would
+        // cancel that in-flight coroutine outright, leaving sensors off after a real unlock.
+        if (!isLocking && PrivacyActionWorker.sensorEnableInProgress) {
+            logDebug(context, "⏳ Sensor enable already in progress - not replacing it (reason: $reason)")
+            return
+        }
+        try {
+            // KEEP: a second screen-off while this lock's job still waits must not restart its delay.
+            val workName = PrivacyActionWork.enqueue(
+                context = context,
+                isLocking = isLocking,
+                isDeviceLocked = isDeviceLocked,
+                trigger = "screen_state",
+                reason = reason,
+                policy = if (isLocking) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE
+            )
+            val outcome = if (isLocking) "enqueued, or the pending one kept" else "enqueued"
+            logDebug(context, "Privacy action work $outcome (unique: $workName) for ${if (isLocking) "lock" else "unlock"} (deviceLocked=$isDeviceLocked)")
+
+        } catch (e: Exception) {
+            logError(context, "Failed to trigger privacy action", e)
+        }
+    }
+
+    companion object {
+        private const val TAG = "hush-ScreenStateReceiver"
+        private val WORK_NAME_LOCK = org.kaijinlab.hush.util.Constants.Work.NAME_LOCK
+        private val WORK_NAME_UNLOCK = org.kaijinlab.hush.util.Constants.Work.NAME_UNLOCK
+    }
+}

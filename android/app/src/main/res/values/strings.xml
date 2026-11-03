@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Hush</string>
+    <string name="widget_name">Hush</string>
+    <string name="widget_description">Toggle protection</string>
+    <string name="widget_privacy_on">Active</string>
+    <string name="widget_privacy_off">Paused</string>
+    <string name="tile_privacy_switch">Hush</string>
+    <string name="accessibility_service_label">Hush</string>
+    <string name="accessibility_service_description">Detect lock screen changes for privacy controls. No screen content is collected.</string>
+</resources>

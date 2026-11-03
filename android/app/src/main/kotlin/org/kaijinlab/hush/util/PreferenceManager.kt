@@ -1,0 +1,335 @@
+package org.kaijinlab.hush.util
+
+import android.content.Context
+import android.content.SharedPreferences
+import org.kaijinlab.hush.data.PrivacyFeature
+import org.kaijinlab.hush.data.TimerSettings
+
+class PreferenceManager private constructor(private val context: Context) {
+    
+    companion object : SingletonHolder<PreferenceManager, Context>({ context ->
+        PreferenceManager(context.applicationContext)
+    })
+    
+    private val prefs: SharedPreferences by lazy {
+        context.getSharedPreferences(Constants.Preferences.PRIVACY_SWITCH_PREFS, Context.MODE_PRIVATE)
+    }
+    
+    var isGlobalPrivacyEnabled: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_GLOBAL_PRIVACY_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_GLOBAL_PRIVACY_ENABLED, value).apply()
+    
+    var lockDelaySeconds: Int
+        get() = prefs.getInt(Constants.Preferences.KEY_LOCK_DELAY, Constants.Defaults.LOCK_DELAY_SECONDS)
+        set(value) = prefs.edit().putInt(Constants.Preferences.KEY_LOCK_DELAY, value).apply()
+    
+    var unlockDelaySeconds: Int
+        get() = prefs.getInt(Constants.Preferences.KEY_UNLOCK_DELAY, Constants.Defaults.UNLOCK_DELAY_SECONDS)
+        set(value) = prefs.edit().putInt(Constants.Preferences.KEY_UNLOCK_DELAY, value).apply()
+    
+    var showCountdown: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_SHOW_COUNTDOWN, Constants.Defaults.SHOW_COUNTDOWN)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_SHOW_COUNTDOWN, value).apply()
+
+    var backgroundServiceEnabled: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_BACKGROUND_SERVICE_ENABLED, Constants.Defaults.BACKGROUND_SERVICE_ENABLED)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_BACKGROUND_SERVICE_ENABLED, value).apply()
+
+    var debugNotificationsEnabled: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_DEBUG_NOTIFICATIONS_ENABLED, Constants.Defaults.DEBUG_NOTIFICATIONS_ENABLED)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_DEBUG_NOTIFICATIONS_ENABLED, value).apply()
+
+    var debugLogsEnabled: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_DEBUG_LOGS_ENABLED, Constants.Defaults.DEBUG_LOGS_ENABLED)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_DEBUG_LOGS_ENABLED, value).apply()
+
+    /**
+     * NFC auto-retry preference. When on, NFC is disabled again (up to 3 times) if it reports
+     * itself enabled right after being turned off, which a payment or wallet app can cause.
+     * Default: false (opt-in).
+     *
+     * Name and stored key both still say "samsung" because the behaviour was first reported
+     * there and the key cannot be renamed without losing the setting for everyone who has
+     * already turned it on. The feature itself applies to every device.
+     */
+    var samsungNfcAutoRetry: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_SAMSUNG_NFC_AUTO_RETRY, false)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_SAMSUNG_NFC_AUTO_RETRY, value).apply()
+
+    var blockWhileLocked: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_BLOCK_WHILE_LOCKED, false)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_BLOCK_WHILE_LOCKED, value).apply()
+
+    fun registerChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+
+    fun unregisterChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs.unregisterOnSharedPreferenceChangeListener(listener)
+
+    /**
+     * Accessibility service preference.
+     * Tracks whether the user has chosen to enable the accessibility service feature.
+     * The actual service must be enabled in Android Settings > Accessibility.
+     * Default: false (opt-in)
+     */
+    var accessibilityServiceEnabled: Boolean
+        get() = prefs.getBoolean(Constants.Preferences.KEY_ACCESSIBILITY_SERVICE_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_ACCESSIBILITY_SERVICE_ENABLED, value).apply()
+    
+    fun hasCustomFeatureDelays(isLocking: Boolean): Boolean =
+        PrivacyFeature.values().any { getFeatureDelayOverride(it, isLocking) != null }
+
+    fun getFeatureDelayOverride(feature: PrivacyFeature, isLocking: Boolean): Int? {
+        val key = featureDelayKey(feature, isLocking)
+        return if (prefs.contains(key)) prefs.getInt(key, 0) else null
+    }
+
+    fun setFeatureDelayOverride(feature: PrivacyFeature, isLocking: Boolean, seconds: Int?) {
+        require(seconds == null || seconds in 0..org.kaijinlab.hush.data.TimerSettings.MAX_DELAY_SECONDS) { "Invalid delay" }
+        val edit = prefs.edit()
+        val key = featureDelayKey(feature, isLocking)
+        if (seconds == null) edit.remove(key) else edit.putInt(key, seconds)
+        edit.apply()
+    }
+
+    fun getFeatureDelaySeconds(feature: PrivacyFeature, isLocking: Boolean): Int =
+        getFeatureDelayOverride(feature, isLocking) ?: when {
+            feature in PrivacyFeature.getSensorFeatures() -> 0
+            isLocking -> lockDelaySeconds
+            else -> unlockDelaySeconds
+        }
+
+    private fun featureDelayKey(feature: PrivacyFeature, isLocking: Boolean): String =
+        "${feature.name.lowercase()}_${if (isLocking) "lock" else "unlock"}_delay_seconds"
+
+    fun getFeatureKeepForMaps(feature: PrivacyFeature): Boolean =
+        feature in MapsConnectivityGuard.FEATURES && prefs.getBoolean("${feature.name.lowercase()}_keep_for_maps", false)
+
+    fun setFeatureKeepForMaps(feature: PrivacyFeature, value: Boolean) {
+        require(feature in MapsConnectivityGuard.FEATURES) { "Maps exception unavailable for this feature" }
+        prefs.edit().putBoolean("${feature.name.lowercase()}_keep_for_maps", value).apply()
+    }
+
+    fun getFeatureDisableOnLock(feature: PrivacyFeature): Boolean {
+        val key = Constants.Preferences.getFeatureLockKey(feature.name)
+        val default = when (feature) {
+            PrivacyFeature.WIFI -> Constants.Defaults.WIFI_DISABLE_ON_LOCK
+            PrivacyFeature.BLUETOOTH -> Constants.Defaults.BLUETOOTH_DISABLE_ON_LOCK
+            PrivacyFeature.LOCATION -> Constants.Defaults.LOCATION_DISABLE_ON_LOCK
+            PrivacyFeature.MOBILE_DATA -> Constants.Defaults.MOBILE_DATA_DISABLE_ON_LOCK
+            PrivacyFeature.NFC -> Constants.Defaults.NFC_DISABLE_ON_LOCK
+            PrivacyFeature.CAMERA -> Constants.Defaults.CAMERA_DISABLE_ON_LOCK
+            PrivacyFeature.MICROPHONE -> Constants.Defaults.MICROPHONE_DISABLE_ON_LOCK
+            PrivacyFeature.AIRPLANE_MODE -> Constants.Defaults.AIRPLANE_MODE_DISABLE_ON_LOCK
+            PrivacyFeature.BATTERY_SAVER -> Constants.Defaults.BATTERY_SAVER_DISABLE_ON_LOCK
+        }
+        return prefs.getBoolean(key, default)
+    }
+    
+    fun setFeatureDisableOnLock(feature: PrivacyFeature, value: Boolean) {
+        val key = Constants.Preferences.getFeatureLockKey(feature.name)
+        prefs.edit().putBoolean(key, value).apply()
+    }
+    
+    fun getFeatureEnableOnUnlock(feature: PrivacyFeature): Boolean {
+        val key = Constants.Preferences.getFeatureUnlockKey(feature.name)
+        val default = when (feature) {
+            PrivacyFeature.WIFI -> Constants.Defaults.WIFI_ENABLE_ON_UNLOCK
+            PrivacyFeature.BLUETOOTH -> Constants.Defaults.BLUETOOTH_ENABLE_ON_UNLOCK
+            PrivacyFeature.LOCATION -> Constants.Defaults.LOCATION_ENABLE_ON_UNLOCK
+            PrivacyFeature.MOBILE_DATA -> Constants.Defaults.MOBILE_DATA_ENABLE_ON_UNLOCK
+            PrivacyFeature.NFC -> Constants.Defaults.NFC_ENABLE_ON_UNLOCK
+            PrivacyFeature.CAMERA -> Constants.Defaults.CAMERA_ENABLE_ON_UNLOCK
+            PrivacyFeature.MICROPHONE -> Constants.Defaults.MICROPHONE_ENABLE_ON_UNLOCK
+            PrivacyFeature.AIRPLANE_MODE -> Constants.Defaults.AIRPLANE_MODE_ENABLE_ON_UNLOCK
+            PrivacyFeature.BATTERY_SAVER -> Constants.Defaults.BATTERY_SAVER_ENABLE_ON_UNLOCK
+        }
+        return prefs.getBoolean(key, default)
+    }
+    
+    fun setFeatureEnableOnUnlock(feature: PrivacyFeature, value: Boolean) {
+        val key = Constants.Preferences.getFeatureUnlockKey(feature.name)
+        prefs.edit().putBoolean(key, value).apply()
+    }
+
+    fun getFeatureOnlyIfUnused(feature: PrivacyFeature): Boolean {
+        val key = Constants.Preferences.getFeatureOnlyIfUnusedKey(feature.name)
+        val default = when (feature) {
+            PrivacyFeature.WIFI -> Constants.Defaults.WIFI_ONLY_IF_UNUSED
+            PrivacyFeature.BLUETOOTH -> Constants.Defaults.BLUETOOTH_ONLY_IF_UNUSED
+            PrivacyFeature.LOCATION -> Constants.Defaults.LOCATION_ONLY_IF_UNUSED
+            PrivacyFeature.MOBILE_DATA -> Constants.Defaults.MOBILE_DATA_ONLY_IF_UNUSED
+            PrivacyFeature.NFC -> Constants.Defaults.NFC_ONLY_IF_UNUSED
+            PrivacyFeature.CAMERA -> Constants.Defaults.CAMERA_ONLY_IF_UNUSED
+            PrivacyFeature.MICROPHONE -> Constants.Defaults.MICROPHONE_ONLY_IF_UNUSED
+            PrivacyFeature.AIRPLANE_MODE -> Constants.Defaults.AIRPLANE_MODE_ONLY_IF_UNUSED
+            PrivacyFeature.BATTERY_SAVER -> Constants.Defaults.BATTERY_SAVER_ONLY_IF_UNUSED
+        }
+        return prefs.getBoolean(key, default)
+    }
+
+    fun setFeatureOnlyIfUnused(feature: PrivacyFeature, value: Boolean) {
+        val key = Constants.Preferences.getFeatureOnlyIfUnusedKey(feature.name)
+        prefs.edit().putBoolean(key, value).apply()
+    }
+
+    /**
+     * Get "only if not manually set" preference for protection modes (Airplane Mode, Battery Saver).
+     * When true, the mode won't be disabled on unlock if it was already enabled before lock.
+     */
+    fun getFeatureOnlyIfNotManual(feature: PrivacyFeature): Boolean {
+        val key = Constants.Preferences.getFeatureOnlyIfNotManualKey(feature.name)
+        val default = when (feature) {
+            PrivacyFeature.AIRPLANE_MODE -> Constants.Defaults.AIRPLANE_MODE_ONLY_IF_NOT_MANUAL
+            PrivacyFeature.BATTERY_SAVER -> Constants.Defaults.BATTERY_SAVER_ONLY_IF_NOT_MANUAL
+            else -> false // Not applicable to other features
+        }
+        return prefs.getBoolean(key, default)
+    }
+
+    fun setFeatureOnlyIfNotManual(feature: PrivacyFeature, value: Boolean) {
+        val key = Constants.Preferences.getFeatureOnlyIfNotManualKey(feature.name)
+        prefs.edit().putBoolean(key, value).apply()
+    }
+
+    /**
+     * Get "only if not already enabled" preference for regular features.
+     * When true, the feature won't be enabled on unlock if it's already enabled.
+     * This prevents connection resets (e.g., WiFi/VPN disconnections).
+     */
+    fun getFeatureOnlyIfNotEnabled(feature: PrivacyFeature): Boolean {
+        val key = Constants.Preferences.getFeatureOnlyIfNotEnabledKey(feature.name)
+        val default = when (feature) {
+            PrivacyFeature.WIFI -> Constants.Defaults.WIFI_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.BLUETOOTH -> Constants.Defaults.BLUETOOTH_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.LOCATION -> Constants.Defaults.LOCATION_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.MOBILE_DATA -> Constants.Defaults.MOBILE_DATA_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.NFC -> Constants.Defaults.NFC_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.CAMERA -> Constants.Defaults.CAMERA_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.MICROPHONE -> Constants.Defaults.MICROPHONE_ONLY_IF_NOT_ENABLED
+            PrivacyFeature.AIRPLANE_MODE -> false // Not applicable to protection modes
+            PrivacyFeature.BATTERY_SAVER -> false // Not applicable to protection modes
+        }
+        return prefs.getBoolean(key, default)
+    }
+
+    fun setFeatureOnlyIfNotEnabled(feature: PrivacyFeature, value: Boolean) {
+        val key = Constants.Preferences.getFeatureOnlyIfNotEnabledKey(feature.name)
+        prefs.edit().putBoolean(key, value).apply()
+    }
+
+    /**
+     * Runtime state tracking: was this protection mode enabled by the app (not manually)?
+     * This is not a user preference, but a state flag used to determine unlock behavior.
+     */
+    fun getFeatureEnabledByApp(feature: PrivacyFeature): Boolean {
+        val key = Constants.Preferences.getFeatureEnabledByAppKey(feature.name)
+        return prefs.getBoolean(key, false)
+    }
+
+    fun setFeatureEnabledByApp(feature: PrivacyFeature, value: Boolean) {
+        val key = Constants.Preferences.getFeatureEnabledByAppKey(feature.name)
+        prefs.edit().putBoolean(key, value).apply()
+    }
+
+    /** Runtime state: the sensors the last lock could not switch off because the phone was already locked. */
+    var sensorsLeftOnAtLastLock: Set<PrivacyFeature>
+        get() = getFeatureSet(Constants.Preferences.KEY_SENSORS_LEFT_ON_AT_LAST_LOCK)
+        set(value) = putFeatureSet(Constants.Preferences.KEY_SENSORS_LEFT_ON_AT_LAST_LOCK, value)
+
+    // A lock job and an unlock job can run at the same time, so the read and the write stay together.
+    @Synchronized
+    fun addFeaturesOffSinceUnlock(features: Collection<PrivacyFeature>) {
+        if (features.isEmpty()) return
+        val key = Constants.Preferences.KEY_FEATURES_OFF_SINCE_UNLOCK
+        putFeatureSet(key, getFeatureSet(key) + features)
+    }
+
+    val featuresOffSinceUnlock: Set<PrivacyFeature>
+        get() = getFeatureSet(Constants.Preferences.KEY_FEATURES_OFF_SINCE_UNLOCK)
+
+    @Synchronized
+    fun removeFeaturesOffSinceUnlock(features: Collection<PrivacyFeature>) {
+        if (features.isEmpty()) return
+        val key = Constants.Preferences.KEY_FEATURES_OFF_SINCE_UNLOCK
+        putFeatureSet(key, getFeatureSet(key) - features.toSet())
+    }
+
+    private fun getFeatureSet(key: String): Set<PrivacyFeature> =
+        (prefs.getString(key, "") ?: "").split(",")
+            .mapNotNull { name -> PrivacyFeature.values().firstOrNull { it.name == name } }
+            .toSet()
+
+    private fun putFeatureSet(key: String, features: Set<PrivacyFeature>) {
+        prefs.edit().putString(key, features.joinToString(",") { it.name }).apply()
+    }
+
+    fun updateTimerSettings(settings: TimerSettings) {
+        prefs.edit().apply {
+            putInt(Constants.Preferences.KEY_LOCK_DELAY, settings.lockDelaySeconds)
+            putInt(Constants.Preferences.KEY_UNLOCK_DELAY, settings.unlockDelaySeconds)
+            putBoolean(Constants.Preferences.KEY_SHOW_COUNTDOWN, settings.showCountdown)
+            apply()
+        }
+    }
+
+    fun updateScreenLockConfig(feature: PrivacyFeature, disableOnLock: Boolean, enableOnUnlock: Boolean) {
+        prefs.edit().apply {
+            putBoolean(Constants.Preferences.getFeatureLockKey(feature.name), disableOnLock)
+            putBoolean(Constants.Preferences.getFeatureUnlockKey(feature.name), enableOnUnlock)
+            apply()
+        }
+    }
+
+    fun getRawPreferences(): SharedPreferences = prefs
+
+    // ========== App Exemption Methods ==========
+
+    /**
+     * Get the set of package names that are exempt from privacy toggles.
+     * When these apps are in the foreground, privacy features won't be disabled.
+     *
+     * @return Set of exempt package names
+     */
+    fun getExemptApps(): Set<String> {
+        val exemptAppsString = prefs.getString(Constants.Preferences.KEY_EXEMPT_APPS, "") ?: ""
+        return if (exemptAppsString.isEmpty()) {
+            emptySet()
+        } else {
+            exemptAppsString.split(",").toSet()
+        }
+    }
+
+    /**
+     * Set the list of apps that are exempt from privacy toggles.
+     *
+     * @param packageNames Set of package names to exempt
+     */
+    fun setExemptApps(packageNames: Set<String>) {
+        val exemptAppsString = packageNames.joinToString(",")
+        prefs.edit().putString(Constants.Preferences.KEY_EXEMPT_APPS, exemptAppsString).apply()
+    }
+
+    /**
+     * Add an app to the exemption list.
+     *
+     * @param packageName Package name to add
+     */
+    fun addExemptApp(packageName: String) {
+        val currentExempt = getExemptApps().toMutableSet()
+        currentExempt.add(packageName)
+        setExemptApps(currentExempt)
+    }
+
+    /**
+     * Remove an app from the exemption list.
+     *
+     * @param packageName Package name to remove
+     */
+    fun removeExemptApp(packageName: String) {
+        val currentExempt = getExemptApps().toMutableSet()
+        currentExempt.remove(packageName)
+        setExemptApps(currentExempt)
+    }
+
+}

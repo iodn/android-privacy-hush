@@ -1,0 +1,2043 @@
+package org.kaijinlab.hush.worker
+
+import android.app.AppOpsManager
+import android.app.Application
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInfo
+import android.media.AudioManager
+import android.os.Process
+import androidx.test.core.app.ApplicationProvider
+import androidx.work.ListenableWorker
+import androidx.work.WorkerFactory
+import androidx.work.WorkerParameters
+import androidx.work.testing.TestListenableWorkerBuilder
+import androidx.work.workDataOf
+import org.kaijinlab.hush.data.FeatureState
+import org.kaijinlab.hush.data.PrivacyFeature
+import org.kaijinlab.hush.data.PrivacyResult
+import org.kaijinlab.hush.privilege.PrivilegeMethod
+import org.kaijinlab.hush.util.PreferenceManager
+import org.kaijinlab.hush.util.PrivacyActionWork
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowLog
+
+/**
+ * Drives the REAL doWork(), not decision functions lifted out of it.
+ *
+ * doWork() used to build all six of its helpers inside its own body, so nothing could stand in
+ * for one and every decision it makes needed a real privileged shell to reach. Its call sites
+ * were therefore read and reasoned about, never run: the ownership rule, both supersede guards
+ * and what the user is actually told all rested on a reading.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class PrivacyActionWorkerDoWorkTest {
+
+    private lateinit var context: Application
+    private lateinit var prefs: PreferenceManager
+    private lateinit var saved: Snapshot
+    private var clock = 0L
+
+    @Before
+    fun setUp() {
+        context = ApplicationProvider.getApplicationContext()
+        prefs = PreferenceManager.getInstance(context)
+        ShadowLog.clear()
+        saved = Snapshot.of(prefs)
+        applyBaseline()
+        PrivacyActionWorker.lastLockAtMillis = 0L
+        PrivacyActionWorker.lastUnlockAtMillis = 0L
+        PrivacyActionWorker.usageAccessWarningLogged.set(false)
+        clock = 0L
+    }
+
+    @After
+    fun tearDown() {
+        // PreferenceManager is a process singleton that Robolectric does not reset, so anything
+        // this class leaves behind reaches later test CLASSES. Putting back what was read, rather
+        // than this class's own baseline, keeps it a no-op whatever the defaults are.
+        saved.restoreInto(prefs)
+        PrivacyActionWorker.lastLockAtMillis = 0L
+        PrivacyActionWorker.lastUnlockAtMillis = 0L
+    }
+
+    private data class Flags(
+        val disableOnLock: Boolean,
+        val enableOnUnlock: Boolean,
+        val onlyIfUnused: Boolean,
+        val onlyIfNotEnabled: Boolean,
+        val onlyIfNotManual: Boolean,
+        val enabledByApp: Boolean,
+        val lockDelay: Int?,
+        val unlockDelay: Int?,
+        val keepMaps: Boolean
+    )
+
+    private class Snapshot(
+        val globalPrivacy: Boolean,
+        val debugNotifications: Boolean,
+        val debugLogs: Boolean,
+        val sensorsLeftOn: Set<PrivacyFeature>,
+        val offSinceUnlock: Set<PrivacyFeature>,
+        val lockDelay: Int,
+        val unlockDelay: Int,
+        val exemptApps: Set<String>,
+        val perFeature: Map<PrivacyFeature, Flags>
+    ) {
+        fun restoreInto(prefs: PreferenceManager) {
+            prefs.isGlobalPrivacyEnabled = globalPrivacy
+            prefs.debugNotificationsEnabled = debugNotifications
+            prefs.debugLogsEnabled = debugLogs
+            prefs.sensorsLeftOnAtLastLock = sensorsLeftOn
+            prefs.removeFeaturesOffSinceUnlock(prefs.featuresOffSinceUnlock)
+            prefs.addFeaturesOffSinceUnlock(offSinceUnlock)
+            prefs.lockDelaySeconds = lockDelay
+            prefs.unlockDelaySeconds = unlockDelay
+            prefs.setExemptApps(exemptApps)
+            perFeature.forEach { (feature, f) ->
+                prefs.setFeatureDisableOnLock(feature, f.disableOnLock)
+                prefs.setFeatureEnableOnUnlock(feature, f.enableOnUnlock)
+                prefs.setFeatureOnlyIfUnused(feature, f.onlyIfUnused)
+                prefs.setFeatureOnlyIfNotEnabled(feature, f.onlyIfNotEnabled)
+                prefs.setFeatureOnlyIfNotManual(feature, f.onlyIfNotManual)
+                prefs.setFeatureEnabledByApp(feature, f.enabledByApp)
+                prefs.setFeatureDelayOverride(feature, true, f.lockDelay)
+                prefs.setFeatureDelayOverride(feature, false, f.unlockDelay)
+                if (feature in org.kaijinlab.hush.util.MapsConnectivityGuard.FEATURES) prefs.setFeatureKeepForMaps(feature, f.keepMaps)
+            }
+        }
+
+        companion object {
+            fun of(prefs: PreferenceManager) = Snapshot(
+                globalPrivacy = prefs.isGlobalPrivacyEnabled,
+                debugNotifications = prefs.debugNotificationsEnabled,
+                debugLogs = prefs.debugLogsEnabled,
+                sensorsLeftOn = prefs.sensorsLeftOnAtLastLock,
+                offSinceUnlock = prefs.featuresOffSinceUnlock,
+                lockDelay = prefs.lockDelaySeconds,
+                unlockDelay = prefs.unlockDelaySeconds,
+                exemptApps = prefs.getExemptApps(),
+                perFeature = PrivacyFeature.values().associateWith {
+                    Flags(
+                        disableOnLock = prefs.getFeatureDisableOnLock(it),
+                        enableOnUnlock = prefs.getFeatureEnableOnUnlock(it),
+                        onlyIfUnused = prefs.getFeatureOnlyIfUnused(it),
+                        onlyIfNotEnabled = prefs.getFeatureOnlyIfNotEnabled(it),
+                        onlyIfNotManual = prefs.getFeatureOnlyIfNotManual(it),
+                        enabledByApp = prefs.getFeatureEnabledByApp(it),
+                        lockDelay = prefs.getFeatureDelayOverride(it, true),
+                        unlockDelay = prefs.getFeatureDelayOverride(it, false),
+                        keepMaps = prefs.getFeatureKeepForMaps(it)
+                    )
+                }
+            )
+        }
+    }
+
+    /** Everything off, so each test turns on only what it is about. */
+    private fun applyBaseline() {
+        prefs.getRawPreferences().edit().remove("last_observed_lock").remove("deferred_generation").commit()
+        prefs.isGlobalPrivacyEnabled = true
+        prefs.debugNotificationsEnabled = true
+        prefs.debugLogsEnabled = false
+        prefs.sensorsLeftOnAtLastLock = emptySet()
+        prefs.removeFeaturesOffSinceUnlock(prefs.featuresOffSinceUnlock)
+        prefs.lockDelaySeconds = 0
+        prefs.unlockDelaySeconds = 0
+        prefs.setExemptApps(emptySet())
+        PrivacyFeature.values().forEach { feature ->
+            prefs.setFeatureDelayOverride(feature, true, null)
+            prefs.setFeatureDelayOverride(feature, false, null)
+            prefs.setFeatureDisableOnLock(feature, false)
+            prefs.setFeatureEnableOnUnlock(feature, false)
+            prefs.setFeatureOnlyIfUnused(feature, false)
+            if (feature in org.kaijinlab.hush.util.MapsConnectivityGuard.FEATURES) prefs.setFeatureKeepForMaps(feature, false)
+            prefs.setFeatureOnlyIfNotEnabled(feature, false)
+            prefs.setFeatureOnlyIfNotManual(feature, false)
+            prefs.setFeatureEnabledByApp(feature, false)
+        }
+    }
+
+    /** Stands in for every fact doWork() reads from outside itself. */
+    private class FakeWorker(
+        context: Context,
+        params: WorkerParameters
+    ) : PrivacyActionWorker(context, params) {
+
+        val states = mutableMapOf<PrivacyFeature, FeatureState>()
+        val enabled = mutableListOf<PrivacyFeature>()
+        val disabled = mutableListOf<PrivacyFeature>()
+        var privileged = true
+        var screenLocked = true
+        var hotspot = false
+        var featureInUse = false
+        var mapsKept: Set<PrivacyFeature> = emptySet()
+        override suspend fun keepForMaps(feature: PrivacyFeature): Boolean = feature in mapsKept
+        var exemptApp: String? = null
+        var realForegroundDetector = false
+        var realInUseCheck = false
+        var enableSucceeds = true
+        var disableSucceeds = true
+        var disableFailsFor: Set<PrivacyFeature> = emptySet()
+        var beforeEnable: (Set<PrivacyFeature>) -> Unit = {}
+        var beforeDisable: (Set<PrivacyFeature>) -> Unit = {}
+        var statusReads = 0
+        // Default exercises the shell route; root policy coverage selects ROOT explicitly.
+        var method = PrivilegeMethod.SHIZUKU
+        var deviceSecurelyLocked = false
+        var backendCannotSwitch: Set<PrivacyFeature> = emptySet()
+        var backendFixesAtUnlock: Set<PrivacyFeature> = emptySet()
+
+        var onConfirmPrivilege: () -> Unit = {}
+
+        override suspend fun confirmPrivilege(): Boolean {
+            onConfirmPrivilege()
+            return privileged
+        }
+
+        var featureClock = 0L
+        val timedActions = mutableListOf<Pair<PrivacyFeature, Long>>()
+        val waits = mutableListOf<Long>()
+        val deferred = mutableListOf<Triple<Set<PrivacyFeature>, Boolean, Long>>()
+        var onDefer: () -> Unit = {}
+        override fun deferFeatures(features: Set<PrivacyFeature>, locking: Boolean, delayMillis: Long, generation: Long) {
+            onDefer()
+            deferred += Triple(features, locking, delayMillis)
+        }
+        var onFeatureWait: () -> Unit = {}
+        override fun actionTimeMillis(): Long = featureClock
+        override suspend fun awaitFeatureDelay(millis: Long) {
+            waits += millis
+            featureClock += millis
+            onFeatureWait()
+        }
+
+        var statusError: Exception? = null
+        var onStatusRead: () -> Unit = {}
+
+        override suspend fun getCurrentStatus(): Map<PrivacyFeature, FeatureState> {
+            statusReads++
+            onStatusRead()
+            statusError?.let { throw it }
+            return states.toMap()
+        }
+
+        override suspend fun enableFeatures(features: Set<PrivacyFeature>): List<PrivacyResult> {
+            timedActions += features.map { it to featureClock }
+            beforeEnable(features)
+            enabled += features
+            return features.map { PrivacyResult(it, enableSucceeds) }
+        }
+
+        override suspend fun disableFeatures(features: Set<PrivacyFeature>): List<PrivacyResult> {
+            timedActions += features.map { it to featureClock }
+            beforeDisable(features)
+            disabled += features
+            return features.map { PrivacyResult(it, disableSucceeds && it !in disableFailsFor) }
+        }
+
+        override suspend fun isFeatureInUse(feature: PrivacyFeature): Boolean =
+            if (realInUseCheck) super.isFeatureInUse(feature) else featureInUse
+
+        override fun privilegeMethod(): PrivilegeMethod = method
+
+        override suspend fun isHotspotActive(): Boolean = hotspot
+
+        override fun getFirstForegroundApp(exemptApps: Set<String>): String? =
+            if (realForegroundDetector) super.getFirstForegroundApp(exemptApps) else exemptApp
+
+        override fun isScreenCurrentlyLocked(): Boolean = screenLocked
+
+        override fun isDeviceSecurelyLocked(): Boolean = deviceSecurelyLocked
+
+        override fun backendCanSwitch(feature: PrivacyFeature): Boolean = feature !in backendCannotSwitch
+
+        override fun unlockDecides(feature: PrivacyFeature): Boolean = feature !in backendFixesAtUnlock
+    }
+
+    private fun worker(
+        isLocking: Boolean,
+        isDeviceLocked: Boolean = false,
+        trigger: String = "test",
+        foundOnAt: Map<PrivacyFeature, Long> = emptyMap(),
+        input: androidx.work.Data? = null
+    ): FakeWorker =
+        TestListenableWorkerBuilder<PrivacyActionWorker>(context)
+            .setInputData(
+                input ?: PrivacyActionWork.buildRequest(isLocking, isDeviceLocked, trigger, "test", foundOnAt).workSpec.input
+            )
+            .setWorkerFactory(object : WorkerFactory() {
+                override fun createWorker(
+                    appContext: Context,
+                    workerClassName: String,
+                    workerParameters: WorkerParameters
+                ) = FakeWorker(appContext, workerParameters)
+            })
+            .build() as FakeWorker
+
+    private fun recordLock() {
+        PrivacyActionWorker.lastLockAtMillis = ++clock
+    }
+
+    private fun recordUnlock() {
+        PrivacyActionWorker.lastUnlockAtMillis = ++clock
+    }
+
+    /**
+     * Every notification doWork() decided to send. NOT proof the user saw one: on a real device
+     * POST_NOTIFICATIONS can be denied and the post is dropped without a word.
+     *
+     * Read from the notifier's own "sent" line rather than from NotificationManager, because
+     * DebugNotificationHelper is a process singleton that caches whichever manager it first saw,
+     * so the shadow of the CURRENT one can read empty whether or not anything fired.
+     */
+    private fun notifications(): List<String> =
+        ShadowLog.getLogs()
+            .mapNotNull { it.msg }
+            .filter { it.startsWith("Debug notification sent: ") }
+            .map { it.removePrefix("Debug notification sent: ") }
+
+    /**
+     * A negative assertion about notifications is worthless on its own: an empty list satisfies
+     * "does not contain X" for reasons that have nothing to do with the code under test.
+     */
+    private fun notificationsSeen(): List<String> {
+        val all = notifications()
+        assertTrue("no notification was captured at all, so nothing may be concluded", all.isNotEmpty())
+        return all
+    }
+
+    @Test
+    fun `a protection mode that is on and owned by this app stays owned through a lock`() {
+        // THE HEADLINE RULE, at the call site that applies it. Disowning here is what used to make
+        // a failed unlock-disable permanent: the mode stayed on, the app blamed the user, and
+        // every later unlock skipped it.
+        //
+        // Both halves run, because "it said nothing" is only evidence next to a case where it
+        // does speak. The unowned half proves the message is reachable at all.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.AIRPLANE_MODE, true)
+        prefs.setFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE, true)
+        recordLock()
+
+        val owned = worker(isLocking = true)
+        owned.states[PrivacyFeature.AIRPLANE_MODE] = FeatureState.ENABLED
+        val ownedResult = runBlocking { owned.doWork() }
+
+        assertEquals(ListenableWorker.Result.success(), ownedResult)
+        assertTrue(
+            "a mode this app failed to turn off is still this app's",
+            prefs.getFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE)
+        )
+        assertTrue(
+            "and the user must not be told it was their own doing, was: ${notifications()}",
+            notifications().none { it.contains("already enabled") }
+        )
+        assertTrue("nor may it be switched again", owned.enabled.isEmpty())
+
+        // Same state, but this app never owned it. Now the message MUST appear.
+        ShadowLog.clear()
+        prefs.setFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE, false)
+        val unowned = worker(isLocking = true)
+        unowned.states[PrivacyFeature.AIRPLANE_MODE] = FeatureState.ENABLED
+        runBlocking { unowned.doWork() }
+
+        assertTrue(
+            "a mode this app never owned is the user's, and it must say so, was: ${notifications()}",
+            notificationsSeen().any { it.contains("already enabled") }
+        )
+        assertFalse(
+            "and it must not quietly claim it",
+            prefs.getFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE)
+        )
+    }
+
+    @Test
+    fun `a mode this app cannot turn back on stops being this app's`() {
+        // The other half of the rule. The mode reads OFF, so nothing this app turned on is still
+        // on, and the enable that follows fails - so nothing re-claims it either.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.AIRPLANE_MODE, true)
+        prefs.setFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.states[PrivacyFeature.AIRPLANE_MODE] = FeatureState.DISABLED
+        worker.enableSucceeds = false
+
+        runBlocking { worker.doWork() }
+
+        assertFalse(
+            "ownership cannot outlive the state it describes",
+            prefs.getFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE)
+        )
+    }
+
+    @Test
+    fun `a re-lock during the unlock's enable step leaves protection modes alone`() {
+        // THE MIRROR GUARD. Enabling WiFi takes a real shell round trip. A lock landing during it
+        // must stop this stale unlock from switching a radio kill-switch OFF on a phone that is
+        // locked right now.
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.AIRPLANE_MODE, true)
+        prefs.setFeatureEnabledByApp(PrivacyFeature.AIRPLANE_MODE, true)
+        recordUnlock()
+
+        val worker = worker(isLocking = false)
+        worker.beforeEnable = { recordLock() }
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("WiFi was enabled, so the gap really opened", worker.enabled.contains(PrivacyFeature.WIFI))
+        assertFalse(
+            "Airplane Mode must not be turned off on a locked phone",
+            worker.disabled.contains(PrivacyFeature.AIRPLANE_MODE)
+        )
+        assertTrue(
+            "and the user must be told why, was: ${notifications()}",
+            notifications().any { it.contains("Locked during the unlock action") }
+        )
+    }
+
+    @Test
+    fun `a sensor disable that fails is reported once, not twice`() {
+        // processResults already reports the failure. The second notification called the same
+        // event "skipped", with a cause nothing had determined, and it was attempted, not skipped.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = false)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        worker.disableSucceeds = false
+
+        runBlocking { worker.doWork() }
+
+        // The WHOLE run's messages, not the ones naming the camera. A duplicate worded without
+        // the feature name is exactly the thing this guards against, and filtering would hide it.
+        val said = notificationsSeen()
+        assertEquals("one failed disable must produce one message, was: $said", 1, said.size)
+        assertTrue(
+            "and it must be the failure, not a skip, was: $said",
+            said.single().contains("Failed to disable: Camera")
+        )
+        assertFalse(
+            "nothing may call an attempted command skipped, was: $said",
+            said.single().contains("Skipped")
+        )
+    }
+
+    @Test
+    fun `sensors are not attempted when the trigger says the device was already locked`() {
+        // The other branch of the same block. The command cannot work with the keyguard up, so it
+        // is skipped rather than spent, and this is the one case where "skipped" is the true word.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = true)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("no shell round trip may be spent", worker.disabled.isEmpty())
+        val said = notificationsSeen()
+        assertEquals("exactly one message, was: $said", 1, said.size)
+        assertTrue("and it must say why, was: $said", said.single().contains("device already locked"))
+    }
+
+    @Test
+    fun `a second trigger for the same lock says nothing about sensors already off`() {
+        // One real lock can raise 2 jobs: the accessibility service fires before
+        // ACTION_SCREEN_OFF, so the second arrives with the phone locked and isDeviceLocked=true.
+        // It used to report the whole list as skipped, naming sensors the FIRST job had just
+        // turned off a second earlier.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        recordLock()
+
+        val second = worker(isLocking = true, isDeviceLocked = true)
+        second.states[PrivacyFeature.CAMERA] = FeatureState.DISABLED
+        second.states[PrivacyFeature.MICROPHONE] = FeatureState.DISABLED
+
+        runBlocking { second.doWork() }
+
+        assertTrue("nothing needed doing", second.disabled.isEmpty())
+        assertTrue(
+            "and nothing untrue may be said about sensors that are already off, was: ${notifications()}",
+            notifications().none { it.contains("device already locked") }
+        )
+    }
+
+    @Test
+    fun `a sensor genuinely still on when the keyguard is up is still reported`() {
+        // The other half. The message is right when it is true, and this is what proves the
+        // silence above is the code deciding, not the path being unreachable.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = true)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        worker.states[PrivacyFeature.MICROPHONE] = FeatureState.DISABLED
+
+        runBlocking { worker.doWork() }
+
+        val said = notificationsSeen()
+        assertTrue("the camera is still on, so say so, was: $said", said.any { it.contains("device already locked") })
+        assertTrue("and it must name the camera, was: $said", said.any { it.contains("Camera") })
+        assertTrue(
+            "but never the microphone, which is already off, was: $said",
+            said.none { it.contains("Microphone") }
+        )
+    }
+
+    @Test
+    fun `a sensor whose state cannot be read is reported, never assumed handled`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = true)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ERROR
+
+        runBlocking { worker.doWork() }
+
+        assertTrue(
+            "nothing observed the camera to be off, so it must not be passed over in silence",
+            notificationsSeen().any { it.contains("device already locked") }
+        )
+        assertEquals("and the main screen says so too", setOf(PrivacyFeature.CAMERA), prefs.sensorsLeftOnAtLastLock)
+    }
+
+    @Test
+    fun `an exempt app in the foreground stops a lock touching anything`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.AIRPLANE_MODE, true)
+        prefs.setExemptApps(setOf("com.example.maps"))
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.exemptApp = "com.example.maps"
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("nothing may be switched off", worker.disabled.isEmpty())
+        assertTrue("nor switched on", worker.enabled.isEmpty())
+        assertTrue(
+            "and the user must be told which app, was: ${notifications()}",
+            notificationsSeen().any { it.contains("com.example.maps") }
+        )
+        assertTrue(
+            "without claiming it is still on screen, which a later lock job cannot know, was: ${notifications()}",
+            notificationsSeen().any { it.contains("was in front at lock") }
+        )
+    }
+
+    @Test
+    fun `with usage access the real detector finds the exempt app and the lock touches nothing`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setExemptApps(setOf("com.example.maps"))
+        val appOps = context.getSystemService(AppOpsManager::class.java)
+        shadowOf(appOps).setMode(
+            AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName, AppOpsManager.MODE_ALLOWED
+        )
+        shadowOf(context.getSystemService(UsageStatsManager::class.java)).addEvent(
+            "com.example.maps", System.currentTimeMillis() - 60_000, UsageEvents.Event.ACTIVITY_RESUMED
+        )
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.realForegroundDetector = true
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("nothing may be switched off", worker.disabled.isEmpty())
+    }
+
+    @Test
+    fun `exempt apps without usage access leave the reason in the log and the lock still runs`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setExemptApps(setOf("com.example.maps"))
+        shadowOf(context.packageManager).installPackage(
+            PackageInfo().apply {
+                packageName = "com.example.maps"
+                applicationInfo = ApplicationInfo().apply { packageName = "com.example.maps" }
+            }
+        )
+        val appOps = context.getSystemService(AppOpsManager::class.java)
+        shadowOf(appOps).setMode(
+            AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName, AppOpsManager.MODE_IGNORED
+        )
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.realForegroundDetector = true
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("the lock must go ahead", worker.disabled.contains(PrivacyFeature.WIFI))
+        assertTrue(
+            "and the log must say why no app could be exempt",
+            ShadowLog.getLogs().any { it.msg?.contains("Usage Access is not granted") == true }
+        )
+    }
+
+    private fun installExemptAppWithUsageAccess(vararg modes: Int) {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setExemptApps(setOf("com.example.maps"))
+        shadowOf(context.packageManager).installPackage(
+            PackageInfo().apply {
+                packageName = "com.example.maps"
+                applicationInfo = ApplicationInfo().apply { packageName = "com.example.maps" }
+            }
+        )
+        val appOps = context.getSystemService(AppOpsManager::class.java)
+        modes.forEach { mode ->
+            shadowOf(appOps).setMode(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName, mode)
+            recordLock()
+            val worker = worker(isLocking = true)
+            worker.realForegroundDetector = true
+            runBlocking { worker.doWork() }
+        }
+    }
+
+    private fun usageAccessWarnings() =
+        ShadowLog.getLogs().count { it.msg?.contains("Usage Access is not granted") == true }
+
+    @Test
+    fun `a lock never asks the backend for a feature it cannot switch`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        recordLock()
+        val worker = worker(isLocking = true)
+        worker.backendCannotSwitch = setOf(PrivacyFeature.WIFI)
+
+        runBlocking { worker.doWork() }
+
+        assertEquals(listOf(PrivacyFeature.BLUETOOTH), worker.disabled)
+    }
+
+    @Test
+    fun `an unlock never asks for a feature whose unlock result the backend fixes`() {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.BLUETOOTH, true)
+        recordUnlock()
+        val worker = worker(isLocking = false)
+        worker.screenLocked = false
+        worker.backendFixesAtUnlock = setOf(PrivacyFeature.BLUETOOTH)
+
+        runBlocking { worker.doWork() }
+
+        assertEquals(listOf(PrivacyFeature.WIFI), worker.enabled)
+    }
+
+    @Test
+    fun `a missing Usage Access is logged once, not on every lock`() {
+        installExemptAppWithUsageAccess(
+            AppOpsManager.MODE_IGNORED, AppOpsManager.MODE_IGNORED, AppOpsManager.MODE_IGNORED
+        )
+
+        assertEquals("one warning for three locks", 1, usageAccessWarnings())
+    }
+
+    @Test
+    fun `losing Usage Access again after it was granted is logged again`() {
+        installExemptAppWithUsageAccess(
+            AppOpsManager.MODE_IGNORED, AppOpsManager.MODE_ALLOWED, AppOpsManager.MODE_IGNORED
+        )
+
+        assertEquals("warned, granted, lost again: two warnings", 2, usageAccessWarnings())
+    }
+
+    @Test
+    fun `an exempt app must not stop an unlock switching things back on`() {
+        // The settings screen promises only that an exempt app stops Hush DISABLING. The
+        // app a user unlocks into is usually the exempt one, so blocking here left the radios and
+        // the sensors off with nothing saying why.
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.BLUETOOTH, true)
+        prefs.setExemptApps(setOf("com.example.maps"))
+        recordUnlock()
+
+        val worker = worker(isLocking = false)
+        worker.exemptApp = "com.example.maps"
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("WiFi must come back", worker.enabled.contains(PrivacyFeature.WIFI))
+        assertTrue("and Bluetooth with it", worker.enabled.contains(PrivacyFeature.BLUETOOTH))
+    }
+
+    @Test
+    fun `a mode whose state could not be read is never claimed, so a later unlock leaves it alone`() {
+        // An enable reports success when its own read-back is unreadable. Claiming on that would
+        // hand the app a mode the USER had already switched on, and switch it off at unlock.
+        val mode = PrivacyFeature.AIRPLANE_MODE
+        prefs.setFeatureDisableOnLock(mode, true)
+        prefs.setFeatureEnableOnUnlock(mode, true)
+        prefs.setFeatureOnlyIfNotManual(mode, true)
+
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.states[mode] = FeatureState.ERROR
+        runBlocking { lock.doWork() }
+
+        assertTrue("it must still try, since nothing said the mode was on", lock.enabled.contains(mode))
+        assertFalse(
+            "but an unreadable state is not evidence this app turned it on",
+            prefs.getFeatureEnabledByApp(mode)
+        )
+
+        // The half that matters to the user: their own Airplane Mode survives the next unlock.
+        ShadowLog.clear()
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        runBlocking { unlock.doWork() }
+
+        assertTrue("a setting this app never claimed is not its to undo", unlock.disabled.isEmpty())
+        assertTrue(
+            "and it must say so, was: ${notifications()}",
+            notificationsSeen().any { it.contains("not turned on by Hush") }
+        )
+    }
+
+    @Test
+    fun `Only if unused keeps a feature that is in use, and the switch off ignores it`() {
+        // The user-facing "Only if unused" switch. With it OFF the feature goes down regardless,
+        // which is what proves the ON case is the switch working and not the fake refusing.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val guarded = worker(isLocking = true)
+        guarded.featureInUse = true
+        runBlocking { guarded.doWork() }
+
+        assertTrue("WiFi is in use, so it must be left alone", guarded.disabled.isEmpty())
+        assertTrue(
+            "and the user must be told why, was: ${notifications()}",
+            notificationsSeen().any { it.contains("in use/connected") }
+        )
+
+        ShadowLog.clear()
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.WIFI, false)
+        val unguarded = worker(isLocking = true)
+        unguarded.featureInUse = true
+        runBlocking { unguarded.doWork() }
+
+        assertTrue(
+            "with the switch off, being in use must not save it",
+            unguarded.disabled.contains(PrivacyFeature.WIFI)
+        )
+    }
+
+    @Test
+    fun `Only if no media is playing keeps Mobile Data on while media plays, and only then`() {
+        // Runs the real in-use check, so the answer comes from AudioManager and not from the fake.
+        val audio = shadowOf(ApplicationProvider.getApplicationContext<Application>().getSystemService(AudioManager::class.java))
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MOBILE_DATA, true)
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.MOBILE_DATA, true)
+        recordLock()
+
+        audio.setIsMusicActive(true)
+        val playing = worker(isLocking = true).apply { realInUseCheck = true }
+        runBlocking { playing.doWork() }
+
+        assertTrue("media is playing, so Mobile Data must be left on", playing.disabled.isEmpty())
+        assertTrue(
+            "and the user must be told why, was: ${notifications()}",
+            notificationsSeen().any { it.contains("in use/connected") }
+        )
+
+        audio.setIsMusicActive(false)
+        val silent = worker(isLocking = true).apply { realInUseCheck = true }
+        runBlocking { silent.doWork() }
+
+        assertEquals("nothing playing, so Mobile Data goes off", listOf(PrivacyFeature.MOBILE_DATA), silent.disabled)
+
+        audio.setIsMusicActive(true)
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.MOBILE_DATA, false)
+        val unticked = worker(isLocking = true).apply { realInUseCheck = true }
+        runBlocking { unticked.doWork() }
+
+        assertEquals("with the box unticked, playing media must not save it", listOf(PrivacyFeature.MOBILE_DATA), unticked.disabled)
+    }
+
+    @Test
+    fun `an active hotspot keeps WiFi and Mobile Data on through a lock`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MOBILE_DATA, true)
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.hotspot = true
+
+        runBlocking { worker.doWork() }
+
+        assertTrue(
+            "cutting either leaves the hotspot broadcasting with nothing to share",
+            worker.disabled.isEmpty()
+        )
+        assertTrue(
+            "and the user must be told why, was: ${notifications()}",
+            notificationsSeen().any { it.contains("hotspot is active") }
+        )
+    }
+
+    @Test
+    fun `Airplane Mode this app failed to turn off is still turned off at the next unlock`() {
+        // THE WHOLE DEFECT, end to end, over four real doWork() runs. Nothing but the stored
+        // preferences carries state between them, which is what the user's phone does too.
+        val mode = PrivacyFeature.AIRPLANE_MODE
+        prefs.setFeatureDisableOnLock(mode, true)
+        prefs.setFeatureEnableOnUnlock(mode, true)
+        prefs.setFeatureOnlyIfNotManual(mode, true)
+
+        // 1. Lock. Airplane Mode is off, so this app turns it on and owns it.
+        recordLock()
+        val lock1 = worker(isLocking = true)
+        lock1.states[mode] = FeatureState.DISABLED
+        runBlocking { lock1.doWork() }
+        assertTrue("this app turned it on", lock1.enabled.contains(mode))
+        assertTrue("so this app owns it", prefs.getFeatureEnabledByApp(mode))
+
+        // 2. Unlock, and the disable FAILS. Airplane Mode is still on and still this app's.
+        recordUnlock()
+        val unlock1 = worker(isLocking = false)
+        unlock1.disableSucceeds = false
+        runBlocking { unlock1.doWork() }
+        assertTrue("a failed disable must not hand ownership away", prefs.getFeatureEnabledByApp(mode))
+
+        // 3. Lock again. Airplane Mode reads ON, and who turned it on is not knowable from here.
+        recordLock()
+        val lock2 = worker(isLocking = true)
+        lock2.states[mode] = FeatureState.ENABLED
+        runBlocking { lock2.doWork() }
+        assertTrue("seeing it on must not make it the user's", prefs.getFeatureEnabledByApp(mode))
+
+        // 4. Unlock again. This is the run that was unreachable before: the app must still try.
+        recordUnlock()
+        val unlock2 = worker(isLocking = false)
+        runBlocking { unlock2.doWork() }
+        assertTrue(
+            "Airplane Mode must be turned off, not skipped as manually set",
+            unlock2.disabled.contains(mode)
+        )
+        assertFalse("and it is nobody's now", prefs.getFeatureEnabledByApp(mode))
+    }
+
+    @Test
+    fun `an unlock during the lock's disable step stops protection modes being switched on`() {
+        // The lock-side twin of the mirror guard. Disabling WiFi takes a real shell round trip,
+        // and putting a phone into Airplane Mode after the user picked it up is the harm.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.AIRPLANE_MODE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.states[PrivacyFeature.AIRPLANE_MODE] = FeatureState.DISABLED
+        worker.beforeDisable = { recordUnlock() }
+
+        runBlocking { worker.doWork() }
+
+        assertTrue("WiFi was disabled, so the gap really opened", worker.disabled.contains(PrivacyFeature.WIFI))
+        assertFalse(
+            "Airplane Mode must not be switched on after the user picked the phone up",
+            worker.enabled.contains(PrivacyFeature.AIRPLANE_MODE)
+        )
+        assertTrue(
+            "and the user must be told why, was: ${notifications()}",
+            notifications().any { it.contains("Unlocked during the lock action") }
+        )
+    }
+
+    @Test
+    fun `a lock already overtaken by an unlock touches nothing at either stage`() {
+        // Covers this direction's 2 remaining checkpoints at once: the sensor stage and the
+        // regular-features stage each refuse, and each says so in its own words.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+        recordUnlock()
+
+        val worker = worker(isLocking = true)
+
+        val result = runBlocking { worker.doWork() }
+
+        assertEquals(
+            "a superseded run must END, not ask WorkManager to run it again",
+            ListenableWorker.Result.success(),
+            result
+        )
+        assertTrue("a stale lock may switch nothing off", worker.disabled.isEmpty())
+        val said = notifications()
+        assertTrue("the sensor stage must refuse, was: $said", said.any { it.contains("unlocked since this lock cycle started") })
+        assertTrue("and so must the regular stage, was: $said", said.any { it.contains("Unlocked during lock cycle") })
+    }
+
+    @Test
+    fun `an unlock already overtaken by a lock touches nothing at either stage`() {
+        // The mirror of the test above, for the other direction's 2 checkpoints.
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        recordUnlock()
+        recordLock()
+
+        val worker = worker(isLocking = false)
+
+        val result = runBlocking { worker.doWork() }
+
+        assertEquals(
+            "a superseded run must END, not ask WorkManager to run it again",
+            ListenableWorker.Result.success(),
+            result
+        )
+        assertTrue("a stale unlock may switch nothing on", worker.enabled.isEmpty())
+        val said = notifications()
+        assertTrue("the sensor stage must refuse, was: $said", said.any { it.contains("locked since this unlock cycle started") })
+        assertTrue("and so must the regular stage, was: $said", said.any { it.contains("Locked during unlock cycle") })
+    }
+
+    @Test
+    fun `without confirmed privilege nothing is touched`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.AIRPLANE_MODE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true)
+        worker.privileged = false
+
+        val result = runBlocking { worker.doWork() }
+
+        assertEquals(
+            "an unconfirmed privilege is a failure, never a quiet success",
+            ListenableWorker.Result.failure(),
+            result
+        )
+        assertTrue("nothing may be switched on a guess", worker.enabled.isEmpty())
+        assertTrue("nor switched off", worker.disabled.isEmpty())
+        assertTrue(
+            "and the user must be told, was: ${notifications()}",
+            notifications().any { it.contains("permission not granted") }
+        )
+    }
+
+    // The debug-log writer echoes each line only after writing it to the file, so these are file lines.
+    private fun backOnLines(): List<String> =
+        ShadowLog.getLogs()
+            .filter { it.tag == "hush-DebugLogHelper" }
+            .mapNotNull { it.msg }
+            .filter { it.startsWith("Logged: ") && it.contains("is on at unlock") }
+
+    /** One lock that switches [feature] off with success, as the phone would run it. */
+    private fun lockTurningOff(feature: PrivacyFeature) {
+        prefs.setFeatureDisableOnLock(feature, true)
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.states[feature] = FeatureState.ENABLED
+        runBlocking { lock.doWork() }
+        assertTrue("the lock must have switched ${feature.displayName} off", lock.disabled.contains(feature))
+    }
+
+    @Test
+    fun `a feature the lock switched off that is on at unlock is named in the debug log`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+
+        ShadowLog.clear()
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { unlock.doWork() }
+
+        val lines = backOnLines()
+        assertEquals("one line for NFC, was: $lines", 1, lines.size)
+        assertTrue("it must name NFC, was: $lines", lines.single().contains("NFC"))
+        assertTrue("and say this app did not switch it back on, was: $lines", lines.single().contains("did not switch it back on"))
+    }
+
+    @Test
+    fun `no line for a feature that is still off, or that the unlock turns back on itself`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+        lockTurningOff(PrivacyFeature.BLUETOOTH)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.BLUETOOTH, true)
+
+        ShadowLog.clear()
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.states[PrivacyFeature.NFC] = FeatureState.DISABLED
+        unlock.states[PrivacyFeature.BLUETOOTH] = FeatureState.ENABLED
+        runBlocking { unlock.doWork() }
+
+        assertTrue("the unlock ran, it switched Bluetooth on", unlock.enabled.contains(PrivacyFeature.BLUETOOTH))
+        assertTrue("nothing is on that this app left off, was: ${backOnLines()}", backOnLines().isEmpty())
+    }
+
+    @Test
+    fun `an unlock clears the record, so the next unlock says nothing`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+
+        recordUnlock()
+        val first = worker(isLocking = false)
+        first.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { first.doWork() }
+        assertEquals("the first unlock names it", 1, backOnLines().size)
+
+        ShadowLog.clear()
+        recordUnlock()
+        val second = worker(isLocking = false)
+        second.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { second.doWork() }
+        assertTrue("no lock since, so nothing to say, was: ${backOnLines()}", backOnLines().isEmpty())
+    }
+
+    @Test
+    fun `a failed disable and a lock overtaken by an unlock are not recorded`() {
+        prefs.debugLogsEnabled = true
+        prefs.setFeatureDisableOnLock(PrivacyFeature.NFC, true)
+
+        recordLock()
+        val failed = worker(isLocking = true)
+        failed.disableSucceeds = false
+        runBlocking { failed.doWork() }
+
+        recordLock()
+        val overtaken = worker(isLocking = true)
+        overtaken.beforeDisable = { recordUnlock() }
+        runBlocking { overtaken.doWork() }
+        assertTrue("the overtaken lock did run its disable", overtaken.disabled.contains(PrivacyFeature.NFC))
+
+        ShadowLog.clear()
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { unlock.doWork() }
+        assertTrue("neither lock may count as turning NFC off, was: ${backOnLines()}", backOnLines().isEmpty())
+    }
+
+    @Test
+    fun `with the debug log off the unlock reads no extra state`() {
+        lockTurningOff(PrivacyFeature.NFC)
+        recordUnlock()
+        val quiet = worker(isLocking = false)
+        quiet.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { quiet.doWork() }
+        assertEquals("the line is for the debug log only, so no shell read", 0, quiet.statusReads)
+
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+        recordUnlock()
+        val logging = worker(isLocking = false)
+        logging.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { logging.doWork() }
+        assertEquals("with the log on it reads once", 1, logging.statusReads)
+    }
+
+    @Test
+    fun `the check runs after everything the unlock switches on`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        unlock.states[PrivacyFeature.CAMERA] = FeatureState.DISABLED
+        unlock.states[PrivacyFeature.WIFI] = FeatureState.DISABLED
+        val readsAtEachEnable = mutableListOf<Int>()
+        unlock.beforeEnable = { readsAtEachEnable += unlock.statusReads }
+        runBlocking { unlock.doWork() }
+
+        assertEquals("camera, then WiFi, were switched on", listOf(PrivacyFeature.CAMERA, PrivacyFeature.WIFI), unlock.enabled)
+        assertEquals(
+            "exactly one read, the check's own, comes after the last enable",
+            readsAtEachEnable.last() + 1,
+            unlock.statusReads
+        )
+        assertEquals("and the check wrote its line", 1, backOnLines().size)
+    }
+
+    @Test
+    fun `a cancelled unlock leaves the record for the unlock that replaces it`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+
+        recordUnlock()
+        val replaced = worker(isLocking = false)
+        replaced.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        replaced.beforeEnable = { throw CancellationException("replaced by a newer unlock") }
+        val thrown = runCatching { runBlocking { replaced.doWork() } }.exceptionOrNull()
+        assertTrue("the first unlock was cancelled, was: $thrown", thrown is CancellationException)
+        assertTrue("it wrote nothing", backOnLines().isEmpty())
+        assertEquals("and left the record", setOf(PrivacyFeature.NFC), prefs.featuresOffSinceUnlock)
+
+        recordUnlock()
+        val replacement = worker(isLocking = false)
+        replacement.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { replacement.doWork() }
+        assertEquals("the replacement names NFC", 1, backOnLines().size)
+        assertTrue("and clears the record", prefs.featuresOffSinceUnlock.isEmpty())
+    }
+
+    @Test
+    fun `a lock recorded while an unlock runs is kept for the next unlock`() {
+        lockTurningOff(PrivacyFeature.NFC)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.beforeEnable = { prefs.addFeaturesOffSinceUnlock(setOf(PrivacyFeature.BLUETOOTH)) }
+        runBlocking { unlock.doWork() }
+
+        assertEquals(
+            "this unlock clears only what it read",
+            setOf(PrivacyFeature.BLUETOOTH),
+            prefs.featuresOffSinceUnlock
+        )
+    }
+
+    @Test
+    fun `one line per feature that reads on, none for a state that cannot be read`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+        lockTurningOff(PrivacyFeature.BLUETOOTH)
+        lockTurningOff(PrivacyFeature.LOCATION)
+        lockTurningOff(PrivacyFeature.WIFI)
+
+        ShadowLog.clear()
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        unlock.states[PrivacyFeature.BLUETOOTH] = FeatureState.ENABLED
+        unlock.states[PrivacyFeature.LOCATION] = FeatureState.ERROR
+        unlock.states[PrivacyFeature.WIFI] = FeatureState.UNKNOWN
+        runBlocking { unlock.doWork() }
+
+        val lines = backOnLines()
+        assertEquals("NFC and Bluetooth, each on its own line, was: $lines", 2, lines.size)
+        assertTrue("NFC named, was: $lines", lines.any { it.contains("NFC") })
+        assertTrue("Bluetooth named, was: $lines", lines.any { it.contains("Bluetooth") })
+    }
+
+    @Test
+    fun `camera is on the record, and the unlock's own camera enable is not counted`() {
+        prefs.debugLogsEnabled = true
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+        val lock = worker(isLocking = true, isDeviceLocked = false)
+        lock.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { lock.doWork() }
+        assertEquals("the sensor step records the camera", setOf(PrivacyFeature.CAMERA), prefs.featuresOffSinceUnlock)
+
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.CAMERA, true)
+        ShadowLog.clear()
+        recordUnlock()
+        val reEnables = worker(isLocking = false)
+        reEnables.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { reEnables.doWork() }
+        assertTrue("this unlock switches the camera on itself, was: ${backOnLines()}", backOnLines().isEmpty())
+
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.CAMERA, false)
+        recordLock()
+        val lockAgain = worker(isLocking = true, isDeviceLocked = false)
+        lockAgain.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { lockAgain.doWork() }
+        ShadowLog.clear()
+        recordUnlock()
+        val leavesIt = worker(isLocking = false)
+        leavesIt.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { leavesIt.doWork() }
+        assertEquals("with Enable on unlock off, a camera that is on is named", 1, backOnLines().size)
+    }
+
+    @Test
+    fun `with Dhizuku the check stays silent, since its start-up lifts every block`() {
+        prefs.debugLogsEnabled = true
+        lockTurningOff(PrivacyFeature.NFC)
+
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.method = PrivilegeMethod.DHIZUKU
+        unlock.states[PrivacyFeature.NFC] = FeatureState.ENABLED
+        runBlocking { unlock.doWork() }
+
+        assertTrue("this app did switch it back on there, was: ${backOnLines()}", backOnLines().isEmpty())
+        assertEquals("so no read either", 0, unlock.statusReads)
+    }
+
+    @Test
+    fun `a lock that finds the phone already locked records the sensors it could not switch off`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = true)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        worker.states[PrivacyFeature.MICROPHONE] = FeatureState.DISABLED
+        runBlocking { worker.doWork() }
+
+        assertEquals(
+            "the main screen names only the sensor that stayed on",
+            setOf(PrivacyFeature.CAMERA),
+            prefs.sensorsLeftOnAtLastLock
+        )
+    }
+
+    @Test
+    fun `each lock records failed sensor protection and clears older warnings`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        val both = setOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)
+
+        prefs.sensorsLeftOnAtLastLock = both
+        recordLock()
+        val inTime = worker(isLocking = true, isDeviceLocked = false)
+        inTime.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        inTime.states[PrivacyFeature.MICROPHONE] = FeatureState.ENABLED
+        runBlocking { inTime.doWork() }
+        assertTrue("switched off in time", prefs.sensorsLeftOnAtLastLock.isEmpty())
+
+        prefs.sensorsLeftOnAtLastLock = both
+        recordLock()
+        val secondTrigger = worker(isLocking = true, isDeviceLocked = true)
+        secondTrigger.states[PrivacyFeature.CAMERA] = FeatureState.DISABLED
+        secondTrigger.states[PrivacyFeature.MICROPHONE] = FeatureState.DISABLED
+        runBlocking { secondTrigger.doWork() }
+        assertTrue("already off, so nothing stayed on", prefs.sensorsLeftOnAtLastLock.isEmpty())
+
+        prefs.sensorsLeftOnAtLastLock = both
+        recordLock()
+        val failed = worker(isLocking = true, isDeviceLocked = false)
+        failed.disableSucceeds = false
+        failed.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        failed.states[PrivacyFeature.MICROPHONE] = FeatureState.ENABLED
+        runBlocking { failed.doWork() }
+        assertEquals("failed attempts remain visible as not blocked", both, prefs.sensorsLeftOnAtLastLock)
+
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, false)
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.MICROPHONE, true)
+        prefs.sensorsLeftOnAtLastLock = both
+        recordLock()
+        val micInUse = worker(isLocking = true, isDeviceLocked = true)
+        micInUse.featureInUse = true
+        micInUse.states[PrivacyFeature.MICROPHONE] = FeatureState.ENABLED
+        runBlocking { micInUse.doWork() }
+        assertTrue("left on for being in use, not for the lock screen", prefs.sensorsLeftOnAtLastLock.isEmpty())
+    }
+
+    @Test
+    fun `a lock that took hold before the camera step is treated as already locked`() {
+        // The trigger saw no credential lock, but one was in force by the time the job ran.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = false)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        worker.states[PrivacyFeature.MICROPHONE] = FeatureState.DISABLED
+        worker.deviceSecurelyLocked = true
+        runBlocking { worker.doWork() }
+
+        assertTrue("Android would refuse, so no shell round trip is spent", worker.disabled.isEmpty())
+        assertEquals("the note names only the sensor read as on", setOf(PrivacyFeature.CAMERA), prefs.sensorsLeftOnAtLastLock)
+        val said = notificationsSeen()
+        assertEquals("one message, was: $said", 1, said.size)
+        assertTrue("saying why, was: $said", said.single().contains("device already locked"))
+    }
+
+    @Test
+    fun `a failed sensor is shown as not blocked without blaming keyguard`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = false)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        worker.states[PrivacyFeature.MICROPHONE] = FeatureState.ENABLED
+        worker.disableFailsFor = setOf(PrivacyFeature.CAMERA)
+        worker.beforeDisable = { worker.deviceSecurelyLocked = true }
+        runBlocking { worker.doWork() }
+
+        assertTrue("the attempt ran", worker.disabled.contains(PrivacyFeature.CAMERA))
+        assertEquals("the failed camera remains visible", setOf(PrivacyFeature.CAMERA), prefs.sensorsLeftOnAtLastLock)
+        val said = notificationsSeen()
+        assertEquals("the failure is reported once, was: $said", 1, said.count { it.contains("Failed to disable: Camera") })
+        assertTrue("and never called skipped, was: $said", said.none { it.contains("Skipped") })
+    }
+
+    @Test
+    fun `with Dhizuku a credential lock does not stop camera and microphone`() {
+        // Dhizuku switches them by device policy, which no lock refuses.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = true)
+        worker.method = PrivilegeMethod.DHIZUKU
+        worker.deviceSecurelyLocked = true
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { worker.doWork() }
+
+        assertTrue("the camera must be switched off", worker.disabled.contains(PrivacyFeature.CAMERA))
+        assertTrue("and nothing claims it could not be", prefs.sensorsLeftOnAtLastLock.isEmpty())
+        assertTrue(
+            "not in a message either, was: ${notifications()}",
+            notificationsSeen().none { it.contains("device already locked") }
+        )
+    }
+
+    @Test
+    fun `a sensor disable that worked leaves no note, even with the phone locked right after`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+
+        val worker = worker(isLocking = true, isDeviceLocked = false)
+        worker.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        worker.beforeDisable = { worker.deviceSecurelyLocked = true }
+        runBlocking { worker.doWork() }
+
+        assertTrue("the camera was switched off", worker.disabled.contains(PrivacyFeature.CAMERA))
+        assertTrue("so nothing stayed on", prefs.sensorsLeftOnAtLastLock.isEmpty())
+        val said = notificationsSeen()
+        assertTrue("nothing says it was locked out, was: $said", said.none { it.contains("device already locked") })
+    }
+
+    @Test
+    fun `a lock that ends before the sensors still clears the note`() {
+        // The note says "at the last lock", so a lock that decided nothing must not keep an older one.
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+
+        prefs.sensorsLeftOnAtLastLock = setOf(PrivacyFeature.CAMERA)
+        prefs.setExemptApps(setOf("com.example.maps"))
+        recordLock()
+        val exempt = worker(isLocking = true, isDeviceLocked = true)
+        exempt.exemptApp = "com.example.maps"
+        exempt.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { exempt.doWork() }
+        assertTrue("an exempt app stopped this lock", exempt.disabled.isEmpty())
+        assertTrue("so it left nothing on for the lock screen", prefs.sensorsLeftOnAtLastLock.isEmpty())
+
+        prefs.setExemptApps(emptySet())
+        prefs.sensorsLeftOnAtLastLock = setOf(PrivacyFeature.CAMERA)
+        recordLock()
+        recordUnlock()
+        runBlocking { worker(isLocking = true, isDeviceLocked = false).doWork() }
+        assertTrue("an overtaken lock clears it too", prefs.sensorsLeftOnAtLastLock.isEmpty())
+
+        prefs.sensorsLeftOnAtLastLock = setOf(PrivacyFeature.CAMERA)
+        recordLock()
+        val unprivileged = worker(isLocking = true, isDeviceLocked = true)
+        unprivileged.privileged = false
+        runBlocking { unprivileged.doWork() }
+        assertTrue("so does a lock without privilege", prefs.sensorsLeftOnAtLastLock.isEmpty())
+
+        prefs.sensorsLeftOnAtLastLock = setOf(PrivacyFeature.CAMERA)
+        prefs.isGlobalPrivacyEnabled = false
+        recordLock()
+        runBlocking { worker(isLocking = true, isDeviceLocked = true).doWork() }
+        assertTrue("and one with protection off", prefs.sensorsLeftOnAtLastLock.isEmpty())
+    }
+
+    @Test
+    fun `the start-up catch-up never touches the note`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        val catchUp = PrivacyActionWork.TRIGGER_SERVICE_INIT
+
+        recordLock()
+        val sets = worker(isLocking = true, isDeviceLocked = true, trigger = catchUp)
+        sets.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { sets.doWork() }
+        assertTrue("no lock the user made, so no note", prefs.sensorsLeftOnAtLastLock.isEmpty())
+
+        prefs.sensorsLeftOnAtLastLock = setOf(PrivacyFeature.CAMERA)
+        recordLock()
+        val keeps = worker(isLocking = true, isDeviceLocked = false, trigger = catchUp)
+        runBlocking { keeps.doWork() }
+        assertTrue("the catch-up did switch the camera off", keeps.disabled.contains(PrivacyFeature.CAMERA))
+        assertEquals("but the note from the real lock stays", setOf(PrivacyFeature.CAMERA), prefs.sensorsLeftOnAtLastLock)
+    }
+
+    // A reblock runs on a phone that is already locked, so the sensors cannot change and the note is the real lock's.
+    @Test
+    fun `a reblock turns features off again but leaves camera, microphone and the note alone`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.sensorsLeftOnAtLastLock = setOf(PrivacyFeature.CAMERA)
+
+        recordLock()
+        val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
+        reblock.method = PrivilegeMethod.DHIZUKU
+        reblock.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        reblock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        runBlocking { reblock.doWork() }
+
+        assertTrue("Wi-Fi goes off again", reblock.disabled.contains(PrivacyFeature.WIFI))
+        assertFalse("the sensor step is skipped", reblock.disabled.contains(PrivacyFeature.CAMERA))
+        assertEquals("the real lock's note stays", setOf(PrivacyFeature.CAMERA), prefs.sensorsLeftOnAtLastLock)
+    }
+
+    @Test
+    fun `a reblock does not wait for the lock delay`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.lockDelaySeconds = 30
+
+        recordLock()
+        val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
+        reblock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        runBlocking { kotlinx.coroutines.withTimeout(5_000) { reblock.doWork() } }
+
+        assertTrue(reblock.disabled.contains(PrivacyFeature.WIFI))
+    }
+
+    // The flag stops an unlock cancelling a sensor change; a reblock has none, so it must stay cancellable.
+    @Test
+    fun `a reblock never holds the flag that stops an unlock from cancelling it`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        var flagWhileStarting: Boolean? = null
+
+        recordLock()
+        val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
+        reblock.onConfirmPrivilege = { flagWhileStarting = PrivacyActionWorker.sensorDisableInProgress }
+        runBlocking { reblock.doWork() }
+        assertEquals(false, flagWhileStarting)
+
+        recordLock()
+        val realLock = worker(isLocking = true, isDeviceLocked = true)
+        realLock.onConfirmPrivilege = { flagWhileStarting = PrivacyActionWorker.sensorDisableInProgress }
+        runBlocking { realLock.doWork() }
+        assertEquals("a real lock still holds it", true, flagWhileStarting)
+    }
+
+    @Test
+    fun `with protection off a lock touches nothing`() {
+        prefs.isGlobalPrivacyEnabled = false
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.AIRPLANE_MODE, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        lock.states[PrivacyFeature.AIRPLANE_MODE] = FeatureState.DISABLED
+        lock.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        runBlocking { lock.doWork() }
+
+        assertTrue("nothing switched off, the camera included", lock.disabled.isEmpty())
+        assertTrue("nothing switched on", lock.enabled.isEmpty())
+        assertTrue("and nothing recorded as switched off", prefs.featuresOffSinceUnlock.isEmpty())
+    }
+
+    @Test
+    fun `protection turned off while locked still lets the unlock undo what the lock did`() {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        lockTurningOff(PrivacyFeature.WIFI)
+        prefs.isGlobalPrivacyEnabled = false
+
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.screenLocked = false
+        unlock.states[PrivacyFeature.WIFI] = FeatureState.DISABLED
+        runBlocking { unlock.doWork() }
+
+        assertEquals("the radio this app turned off comes back", listOf(PrivacyFeature.WIFI), unlock.enabled)
+    }
+
+    @Test
+    fun `an unlock that stops early keeps the record, so the next unlock still restores`() {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        lockTurningOff(PrivacyFeature.WIFI)
+        prefs.isGlobalPrivacyEnabled = false
+
+        recordUnlock()
+        val unprivileged = worker(isLocking = false)
+        unprivileged.privileged = false
+        runBlocking { unprivileged.doWork() }
+        assertEquals("nothing was restored, so nothing is forgotten", setOf(PrivacyFeature.WIFI), prefs.featuresOffSinceUnlock)
+
+        recordUnlock()
+        val next = worker(isLocking = false)
+        next.screenLocked = false
+        runBlocking { next.doWork() }
+        assertEquals(listOf(PrivacyFeature.WIFI), next.enabled)
+    }
+
+    @Test
+    fun `a feature whose restore failed stays on the record for the next unlock`() {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        lockTurningOff(PrivacyFeature.WIFI)
+        prefs.isGlobalPrivacyEnabled = false
+
+        recordUnlock()
+        val failed = worker(isLocking = false)
+        failed.screenLocked = false
+        failed.enableSucceeds = false
+        runBlocking { failed.doWork() }
+        assertEquals(setOf(PrivacyFeature.WIFI), prefs.featuresOffSinceUnlock)
+
+        recordUnlock()
+        val next = worker(isLocking = false)
+        next.screenLocked = false
+        runBlocking { next.doWork() }
+        assertEquals(listOf(PrivacyFeature.WIFI), next.enabled)
+        assertTrue("restored now, so the record is clear", prefs.featuresOffSinceUnlock.isEmpty())
+    }
+
+    @Test
+    fun `a lock during an unlock keeps the record, so the camera it switched off again comes back`() {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.CAMERA, true)
+        lockTurningOff(PrivacyFeature.CAMERA)
+        prefs.isGlobalPrivacyEnabled = false
+
+        recordUnlock()
+        val overtaken = worker(isLocking = false)
+        overtaken.screenLocked = false
+        // A newer lock lands while this unlock runs and switches the camera off again.
+        overtaken.onConfirmPrivilege = { recordLock() }
+        runBlocking { overtaken.doWork() }
+        assertTrue("the overtaken unlock switched nothing on", overtaken.enabled.isEmpty())
+        assertEquals(setOf(PrivacyFeature.CAMERA), prefs.featuresOffSinceUnlock)
+
+        recordUnlock()
+        val next = worker(isLocking = false)
+        next.screenLocked = false
+        runBlocking { next.doWork() }
+        assertEquals(listOf(PrivacyFeature.CAMERA), next.enabled)
+    }
+
+    @Test
+    fun `with protection off a lock during the unlock does not keep what the unlock restored`() {
+        // That lock switches nothing, so keeping WIFI would let a later unlock undo the user's own switch-off.
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        lockTurningOff(PrivacyFeature.WIFI)
+        prefs.isGlobalPrivacyEnabled = false
+
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.screenLocked = false
+        unlock.beforeEnable = { recordLock() }
+        runBlocking { unlock.doWork() }
+
+        assertEquals(listOf(PrivacyFeature.WIFI), unlock.enabled)
+        assertTrue("restored, so off the record, was: ${prefs.featuresOffSinceUnlock}", prefs.featuresOffSinceUnlock.isEmpty())
+    }
+
+    @Test
+    fun `with protection off a reblock touches nothing`() {
+        prefs.isGlobalPrivacyEnabled = false
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.addFeaturesOffSinceUnlock(setOf(PrivacyFeature.WIFI))
+        recordLock()
+
+        val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
+        reblock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        runBlocking { reblock.doWork() }
+
+        assertTrue("protection is off, so the user's Wi-Fi stays on", reblock.disabled.isEmpty())
+        assertTrue(reblock.enabled.isEmpty())
+        assertEquals("the record stays for the next unlock", setOf(PrivacyFeature.WIFI), prefs.featuresOffSinceUnlock)
+    }
+
+    @Test
+    fun `with protection off an unlock leaves alone what this app did not do`() {
+        // Without this limit, every unlock with protection off would switch radios on and modes off.
+        prefs.isGlobalPrivacyEnabled = false
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.BLUETOOTH, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.AIRPLANE_MODE, true)
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.BATTERY_SAVER, true)
+        prefs.setFeatureEnabledByApp(PrivacyFeature.BATTERY_SAVER, true)
+
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.screenLocked = false
+        unlock.states[PrivacyFeature.BLUETOOTH] = FeatureState.DISABLED
+        runBlocking { unlock.doWork() }
+
+        assertTrue("Bluetooth was off by the user's hand, was: ${unlock.enabled}", unlock.enabled.isEmpty())
+        assertEquals(
+            "only the mode this app turned on is turned off",
+            listOf(PrivacyFeature.BATTERY_SAVER),
+            unlock.disabled
+        )
+    }
+
+    @Test
+    fun `a lock tells a radio it turned off apart from one that was already off`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        lock.states[PrivacyFeature.BLUETOOTH] = FeatureState.DISABLED
+        // A real switch changes what a later read sees, so a read taken after it would call Wi-Fi already off.
+        lock.beforeDisable = { switched -> switched.forEach { lock.states[it] = FeatureState.DISABLED } }
+        runBlocking { lock.doWork() }
+
+        assertEquals("what gets switched is unchanged", setOf(PrivacyFeature.WIFI, PrivacyFeature.BLUETOOTH), lock.disabled.toSet())
+        assertEquals("one read for the whole lock", 1, lock.statusReads)
+        val sent = notificationsSeen()
+        val wifi = PrivacyFeature.WIFI.displayName
+        val bluetooth = PrivacyFeature.BLUETOOTH.displayName
+        assertTrue("Wi-Fi was on, so this lock turned it off, was: $sent", sent.any { it.contains("Disabling") && it.contains(wifi) })
+        assertTrue("Bluetooth was already off, was: $sent", sent.any { it.contains("$bluetooth - already off") })
+        assertTrue("and is not claimed as switched off, was: $sent", sent.none { it.contains("Disabling") && it.contains(bluetooth) })
+    }
+
+    @Test
+    fun `a reblock says a radio was found on while locked, and how long after it was seen`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        recordLock()
+
+        val seenAt = android.os.SystemClock.elapsedRealtime()
+        val reblock = worker(
+            isLocking = true,
+            isDeviceLocked = true,
+            trigger = PrivacyActionWork.TRIGGER_REBLOCK,
+            foundOnAt = mapOf(PrivacyFeature.BLUETOOTH to seenAt)
+        )
+        reblock.states[PrivacyFeature.BLUETOOTH] = FeatureState.ENABLED
+        runBlocking { reblock.doWork() }
+
+        val bluetooth = PrivacyFeature.BLUETOOTH.displayName
+        val sent = notificationsSeen()
+        assertTrue("was: $sent", sent.any { it.contains("Found ON while locked") && it.contains(bluetooth) && it.contains("s after it was seen on") })
+        assertTrue("not the plain lock line, was: $sent", sent.none { it.contains("Disabling") && it.contains(bluetooth) })
+    }
+
+    @Test
+    fun `with debug output off the lock reads no extra state`() {
+        prefs.debugNotificationsEnabled = false
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        runBlocking { lock.doWork() }
+
+        assertEquals(listOf(PrivacyFeature.WIFI), lock.disabled)
+        assertEquals("the read exists only for the debug output", 0, lock.statusReads)
+    }
+
+    @Test
+    fun `a radio whose state cannot be read is still switched and said plainly, not guessed`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        runBlocking { lock.doWork() }
+
+        val wifi = PrivacyFeature.WIFI.displayName
+        assertEquals(listOf(PrivacyFeature.WIFI), lock.disabled)
+        assertTrue(ShadowLog.getLogs().any { it.msg?.contains("$wifi switched off - its state before could not be read") == true })
+        assertTrue("never called already off", notificationsSeen().none { it.contains("already off") })
+    }
+
+    @Test
+    fun `the seconds since a turn-on was seen are the real gap, and left out when they cannot be right`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        recordLock()
+        val bluetooth = PrivacyFeature.BLUETOOTH.displayName
+
+        val seenAt = android.os.SystemClock.elapsedRealtime()
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(5))
+        val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK, foundOnAt = mapOf(PrivacyFeature.BLUETOOTH to seenAt))
+        reblock.states[PrivacyFeature.BLUETOOTH] = FeatureState.ENABLED
+        runBlocking { reblock.doWork() }
+        assertTrue("was: ${notifications()}", notifications().any { it.contains("$bluetooth - turned off 5 s after it was seen on") })
+
+        ShadowLog.clear()
+        val fromOldBoot = android.os.SystemClock.elapsedRealtime() + 60_000
+        val stale = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK, foundOnAt = mapOf(PrivacyFeature.BLUETOOTH to fromOldBoot))
+        stale.states[PrivacyFeature.BLUETOOTH] = FeatureState.ENABLED
+        runBlocking { stale.doWork() }
+        val sent = notificationsSeen()
+        assertTrue("still reported, was: $sent", sent.any { it.contains("Found ON while locked") })
+        assertTrue("but with no made-up gap, was: $sent", sent.none { it.contains("after it was seen on") })
+    }
+
+    @Test
+    fun `with only the debug log on the lock still reads once and writes the lines`() {
+        prefs.debugNotificationsEnabled = false
+        prefs.debugLogsEnabled = true
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        runBlocking { lock.doWork() }
+
+        assertEquals(1, lock.statusReads)
+        val wifi = PrivacyFeature.WIFI.displayName
+        assertTrue(ShadowLog.getLogs().any { it.msg?.contains("$wifi was on - turned off by Hush") == true })
+    }
+
+    @Test
+    fun `a failing debug read never stops the lock switching`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.statusError = IllegalStateException("shell gone")
+        val result = runBlocking { lock.doWork() }
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        assertEquals(listOf(PrivacyFeature.WIFI), lock.disabled)
+    }
+
+    @Test
+    fun `each feature found on gets its own seen time, and none when it has none`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        recordLock()
+
+        val bluetoothSeen = android.os.SystemClock.elapsedRealtime()
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(7))
+        val reblock = worker(
+            isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK,
+            foundOnAt = mapOf(PrivacyFeature.BLUETOOTH to bluetoothSeen)
+        )
+        reblock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        reblock.states[PrivacyFeature.BLUETOOTH] = FeatureState.ENABLED
+        runBlocking { reblock.doWork() }
+
+        val sent = notificationsSeen().single { it.contains("Found ON while locked") }
+        assertTrue("was: $sent", sent.contains("${PrivacyFeature.BLUETOOTH.displayName} - turned off 7 s after it was seen on"))
+        assertTrue("Wi-Fi has no time of its own, was: $sent", sent.contains("${PrivacyFeature.WIFI.displayName} - turned off;") || sent.endsWith("${PrivacyFeature.WIFI.displayName} - turned off"))
+    }
+
+    @Test
+    fun `a radio that fails to switch off is still reported as failed with the report on`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        lock.disableFailsFor = setOf(PrivacyFeature.WIFI)
+        runBlocking { lock.doWork() }
+
+        val sent = notificationsSeen()
+        assertTrue("was: $sent", sent.any { it.contains("Failed to disable") && it.contains(PrivacyFeature.WIFI.displayName) })
+        assertTrue("and never called switched off, was: $sent", sent.none { it.contains("Disabling") })
+    }
+
+    @Test
+    fun `an unlock landing during the read stops the lock from switching`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        var reads = 0
+        lock.onStatusRead = { if (++reads == 1) recordUnlock() }
+        runBlocking { lock.doWork() }
+
+        assertTrue("the phone was unlocked mid-read, was: ${lock.disabled}", lock.disabled.isEmpty())
+    }
+
+    @Test
+    fun `a reblock that finds a feature already off never calls it found on`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.NFC, true)
+        recordLock()
+
+        val reblock = worker(
+            isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK,
+            foundOnAt = mapOf(PrivacyFeature.NFC to android.os.SystemClock.elapsedRealtime())
+        )
+        reblock.states[PrivacyFeature.NFC] = FeatureState.DISABLED
+        runBlocking { reblock.doWork() }
+
+        val sent = notificationsSeen()
+        assertTrue("was: $sent", sent.any { it.contains("${PrivacyFeature.NFC.displayName} - already off") })
+        assertTrue("was: $sent", sent.none { it.contains("Found ON while locked") })
+    }
+
+    @Test
+    fun `a lock that finds every radio already off reports no empty switch-off`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        recordLock()
+
+        val lock = worker(isLocking = true)
+        lock.states[PrivacyFeature.WIFI] = FeatureState.DISABLED
+        runBlocking { lock.doWork() }
+
+        val lines = ShadowLog.getLogs().mapNotNull { it.msg }
+        assertTrue("the already-off line is there", lines.any { it.contains("${PrivacyFeature.WIFI.displayName} was already off") })
+        assertTrue("and no '0/0 disabled' line, was: ${lines.filter { it.contains("completed") }}", lines.none { it.contains("Lock action completed: 0/0") })
+    }
+    @Test fun `each lock feature runs at its own deadline and defaults still apply`() {
+        prefs.lockDelaySeconds = 10
+        listOf(PrivacyFeature.WIFI, PrivacyFeature.BLUETOOTH, PrivacyFeature.NFC).forEach { prefs.setFeatureDisableOnLock(it, true) }
+        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
+        prefs.setFeatureDelayOverride(PrivacyFeature.NFC, true, 20)
+        recordLock()
+        val lock = worker(isLocking = true)
+        runBlocking { lock.doWork() }
+        assertEquals(listOf(PrivacyFeature.WIFI to 5000L, PrivacyFeature.BLUETOOTH to 10000L, PrivacyFeature.NFC to 20000L), lock.timedActions)
+        assertEquals(listOf(5000L, 5000L, 10000L), lock.waits)
+    }
+
+    @Test fun `a slow action does not add its duration to the next feature delay`() {
+        prefs.lockDelaySeconds = 10
+        listOf(PrivacyFeature.WIFI, PrivacyFeature.BLUETOOTH, PrivacyFeature.NFC).forEach { prefs.setFeatureDisableOnLock(it, true) }
+        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
+        prefs.setFeatureDelayOverride(PrivacyFeature.NFC, true, 20)
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.beforeDisable = { if (PrivacyFeature.WIFI in it) lock.featureClock += 7000L }
+        runBlocking { lock.doWork() }
+        assertEquals(listOf(PrivacyFeature.WIFI to 5000L, PrivacyFeature.BLUETOOTH to 12000L, PrivacyFeature.NFC to 20000L), lock.timedActions)
+    }
+
+    @Test fun `unlock timers restore independently and preserve later restoration records`() {
+        prefs.unlockDelaySeconds = 1
+        val selected = listOf(PrivacyFeature.NFC, PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)
+        selected.forEach { prefs.setFeatureEnableOnUnlock(it, true) }
+        prefs.setFeatureDelayOverride(PrivacyFeature.CAMERA, false, 2)
+        prefs.setFeatureDelayOverride(PrivacyFeature.MICROPHONE, false, 5)
+        prefs.addFeaturesOffSinceUnlock(selected)
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.screenLocked = false
+        unlock.beforeEnable = {
+            if (PrivacyFeature.NFC in it) assertTrue(prefs.featuresOffSinceUnlock.containsAll(listOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)))
+        }
+        runBlocking { unlock.doWork() }
+        assertEquals(listOf(PrivacyFeature.NFC to 1000L, PrivacyFeature.CAMERA to 2000L, PrivacyFeature.MICROPHONE to 5000L), unlock.timedActions)
+        assertTrue(prefs.featuresOffSinceUnlock.isEmpty())
+    }
+
+    @Test fun `unlock during a custom lock delay cancels remaining features`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.onFeatureWait = { recordUnlock(); lock.screenLocked = false }
+        runBlocking { lock.doWork() }
+        assertTrue(lock.disabled.isEmpty())
+        assertFalse(PrivacyActionWorker.sensorDisableInProgress)
+    }
+
+    @Test fun `pausing protection during a custom delay prevents the lock action`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.onFeatureWait = { prefs.isGlobalPrivacyEnabled = false }
+        runBlocking { lock.doWork() }
+        assertTrue(lock.disabled.isEmpty())
+    }
+
+    @Test fun `relocking during a custom unlock delay preserves the outstanding restoration record`() {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, false, 5)
+        prefs.addFeaturesOffSinceUnlock(listOf(PrivacyFeature.WIFI))
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.screenLocked = false
+        unlock.onFeatureWait = { recordLock(); unlock.screenLocked = true }
+        runBlocking { unlock.doWork() }
+        assertTrue(unlock.enabled.isEmpty())
+        assertTrue(PrivacyFeature.WIFI in prefs.featuresOffSinceUnlock)
+    }
+
+    @Test fun `delayed sensors report each sensor that Android refuses to block`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.CAMERA, true, 2)
+        prefs.setFeatureDelayOverride(PrivacyFeature.MICROPHONE, true, 5)
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.deviceSecurelyLocked = true
+        lock.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
+        lock.states[PrivacyFeature.MICROPHONE] = FeatureState.ENABLED
+        runBlocking { lock.doWork() }
+        assertTrue(lock.disabled.isEmpty())
+        assertEquals(setOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE), prefs.sensorsLeftOnAtLastLock)
+    }
+
+    @Test fun `in use checks are evaluated when the custom deadline arrives`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.BLUETOOTH, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.BLUETOOTH, true, 5)
+        recordLock()
+        val lock = worker(isLocking = true)
+        lock.onFeatureWait = { lock.featureInUse = true }
+        runBlocking { lock.doWork() }
+        assertTrue(lock.disabled.isEmpty())
+    }
+
+    @Test fun `reblocking a due feature never brings a later feature forward`() {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.NFC, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.NFC, true, 30)
+        prefs.addFeaturesOffSinceUnlock(listOf(PrivacyFeature.WIFI))
+        recordLock()
+        val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
+        runBlocking { reblock.doWork() }
+        assertEquals(listOf(PrivacyFeature.WIFI), reblock.disabled)
+        assertTrue(reblock.waits.isEmpty())
+    }
+
+    @Test fun `paused protection with custom timing does not wait for unneeded unlock actions`() {
+        prefs.isGlobalPrivacyEnabled = false
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.CAMERA, false, 20)
+        recordUnlock()
+        val unlock = worker(isLocking = false)
+        unlock.screenLocked = false
+        runBlocking { unlock.doWork() }
+        assertTrue(unlock.waits.isEmpty())
+        assertTrue(unlock.enabled.isEmpty())
+    }
+    @Test fun `thirty minute global timer is persisted without keeping worker alive`() = runBlocking {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.lockDelaySeconds = 1800
+        recordLock()
+        val lock = worker(true)
+        assertEquals(ListenableWorker.Result.success(), lock.doWork())
+        assertEquals(listOf(Triple(setOf(PrivacyFeature.WIFI), true, 1800000L)), lock.deferred)
+        assertTrue(lock.waits.isEmpty())
+        assertTrue(lock.disabled.isEmpty())
+    }
+
+    @Test fun `immediate camera precedes persistent scheduling and short timer remains independent`() = runBlocking {
+        for (feature in listOf(PrivacyFeature.WIFI, PrivacyFeature.CAMERA, PrivacyFeature.BATTERY_SAVER)) {
+            prefs.setFeatureDisableOnLock(feature, true)
+        }
+        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 2)
+        prefs.setFeatureDelayOverride(PrivacyFeature.BATTERY_SAVER, true, 1800)
+        recordLock()
+        val lock = worker(true)
+        lock.onDefer = { assertTrue(lock.disabled.contains(PrivacyFeature.CAMERA)) }
+        lock.doWork()
+        assertEquals(listOf(2000L), lock.waits)
+        assertEquals(listOf(PrivacyFeature.CAMERA to 0L, PrivacyFeature.WIFI to 2000L), lock.timedActions)
+        assertEquals(listOf(Triple(setOf(PrivacyFeature.BATTERY_SAVER), true, 1800000L)), lock.deferred)
+    }
+
+    @Test fun `thirty minute unlock uses its own persistent deadline`() = runBlocking {
+        prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
+        prefs.unlockDelaySeconds = 1800
+        prefs.addFeaturesOffSinceUnlock(setOf(PrivacyFeature.WIFI))
+        recordUnlock()
+        val unlock = worker(false).apply { screenLocked = false }
+        unlock.doWork()
+        assertEquals(listOf(Triple(setOf(PrivacyFeature.WIFI), false, 1800000L)), unlock.deferred)
+        assertTrue(unlock.waits.isEmpty())
+        assertTrue(unlock.enabled.isEmpty())
+    }
+
+    @Test fun `keep off does not bring a global thirty minute action forward`() = runBlocking {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.lockDelaySeconds = 1800
+        recordLock()
+        val reblock = worker(true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
+        reblock.doWork()
+        assertTrue(reblock.disabled.isEmpty())
+        assertTrue(reblock.deferred.isEmpty())
+    }
+
+    @Test fun `paused protection creates no thirty minute timers`() = runBlocking {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.lockDelaySeconds = 1800
+        prefs.isGlobalPrivacyEnabled = false
+        recordLock()
+        val lock = worker(true)
+        lock.doWork()
+        assertTrue(lock.deferred.isEmpty())
+        assertTrue(lock.disabled.isEmpty())
+    }
+
+    @Test fun `durable timer never fires after its lock cycle was superseded`() = runBlocking {
+        val work = org.kaijinlab.hush.util.DeferredActionWork
+        work.recordState(context, true)
+        val input = work.buildRequest(setOf(PrivacyFeature.WIFI), true, 1800000L, work.generation(context)).workSpec.input
+        work.recordState(context, false)
+        work.recordState(context, true)
+        val stale = worker(true, input = input)
+        stale.doWork()
+        assertEquals(0, stale.statusReads)
+        assertTrue(stale.disabled.isEmpty())
+    }
+
+    @Test fun `durable timer verifies live screen state even without an unlock broadcast`() = runBlocking {
+        val work = org.kaijinlab.hush.util.DeferredActionWork
+        val input = work.buildRequest(setOf(PrivacyFeature.WIFI), true, 1800000L, work.generation(context)).workSpec.input
+        val stale = worker(true, input = input).apply { screenLocked = false }
+        stale.doWork()
+        assertEquals(0, stale.statusReads)
+        assertTrue(stale.disabled.isEmpty())
+    }
+
+
+
+    @Test fun `due durable job executes only its own features without repeating the global wait`() = runBlocking {
+        org.kaijinlab.hush.initWorkManagerWithoutRealWork(context)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
+        prefs.lockDelaySeconds = 1800
+        recordLock()
+        val work = org.kaijinlab.hush.util.DeferredActionWork
+        val input = work.buildRequest(setOf(PrivacyFeature.WIFI), true, 1800000L, work.generation(context)).workSpec.input
+        val due = worker(true, input = input)
+        due.doWork()
+        assertEquals(listOf(PrivacyFeature.WIFI), due.disabled)
+        assertTrue(due.waits.isEmpty())
+        assertTrue(due.deferred.isEmpty())
+        assertTrue(PrivacyFeature.WIFI in prefs.featuresOffSinceUnlock)
+        assertFalse(PrivacyFeature.BLUETOOTH in prefs.featuresOffSinceUnlock)
+    }
+
+    @Test fun `root blocks both sensors even when the phone is already securely locked`() = runBlocking {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
+        recordLock()
+        val lock = worker(true, isDeviceLocked = true).apply {
+            method = PrivilegeMethod.ROOT
+            deviceSecurelyLocked = true
+        }
+        lock.doWork()
+        assertTrue(lock.disabled.containsAll(setOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)))
+        assertTrue(prefs.sensorsLeftOnAtLastLock.isEmpty())
+    }
+
+    @Test fun `Maps exempts location and internet while camera rules still execute`() = runBlocking {
+        val network = setOf(PrivacyFeature.LOCATION,PrivacyFeature.WIFI,PrivacyFeature.MOBILE_DATA)
+        for (f in network + PrivacyFeature.CAMERA) prefs.setFeatureDisableOnLock(f,true)
+        recordLock()
+        val lock=worker(true).apply { mapsKept=network }
+        lock.doWork()
+        assertEquals(setOf(PrivacyFeature.CAMERA),lock.disabled.toSet())
+        assertTrue(prefs.featuresOffSinceUnlock.none { it in network })
+    }
+    @Test fun `Maps starting during a feature timer is checked at its deadline`() = runBlocking {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.LOCATION,true)
+        prefs.setFeatureDelayOverride(PrivacyFeature.LOCATION,true,5)
+        recordLock()
+        val lock=worker(true)
+        lock.onFeatureWait={lock.mapsKept=setOf(PrivacyFeature.LOCATION)}
+        lock.doWork();assertTrue(lock.disabled.isEmpty())
+        assertEquals(listOf(5000L),lock.waits)
+    }
+    @Test fun `keep off corrections cannot interrupt Maps`() = runBlocking {
+        prefs.setFeatureDisableOnLock(PrivacyFeature.LOCATION,true)
+        prefs.addFeaturesOffSinceUnlock(setOf(PrivacyFeature.LOCATION))
+        recordLock()
+        val correction=worker(true,trigger=PrivacyActionWork.TRIGGER_REBLOCK).apply {mapsKept=setOf(PrivacyFeature.LOCATION)}
+        correction.doWork();assertTrue(correction.disabled.isEmpty())
+    }
+
+}

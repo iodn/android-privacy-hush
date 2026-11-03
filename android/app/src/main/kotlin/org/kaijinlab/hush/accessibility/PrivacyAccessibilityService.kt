@@ -1,0 +1,267 @@
+package org.kaijinlab.hush.accessibility
+
+import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.accessibility.AccessibilityEvent
+import androidx.work.WorkManager
+import org.kaijinlab.hush.util.PendingLockWork
+import org.kaijinlab.hush.util.PreferenceManager
+import org.kaijinlab.hush.worker.PrivacyActionWorker
+import org.kaijinlab.hush.util.PrivacyActionWork
+
+// A second lock/unlock signal from the lock screen window. It sees the keyguard once it is up, so it
+// cannot beat an instant power-button lock to camera/microphone (seen on a real Android 14 phone).
+class PrivacyAccessibilityService : AccessibilityService() {
+
+    companion object {
+        private const val TAG = "hush-AccessibilityService"
+        
+        @Volatile
+        private var isServiceRunning = false
+
+        // Tracks whether the last window this service saw was the lock screen. This service has
+        // its own, fully independent way to arm a lock cycle - it never relied on
+        // ScreenStateReceiver being alive, so it should not rely on it to notice an unlock
+        // either. Set true the moment a lock screen class is seen; the next window event that
+        // is NOT a lock screen class, while this is still true, is the same "the lock screen
+        // just went away" signal ACTION_USER_PRESENT represents, just observed through this
+        // service's own event stream instead of a broadcast.
+        // Internal, not private: it survives between tests as a static, so a test must be able to
+        // clear it or the arming step of the next test silently becomes a no-op.
+        @Volatile
+        internal var wasShowingKeyguard = false
+
+        // Without this, a missed unlock (KeyguardManager's own state lagging the event that
+        // triggered the check - a dismiss animation, an OEM quirk) can persist forever if no
+        // further window event ever arrives (a glance-and-relock with no navigation) - proven by
+        // "A3 fix - a missed race is still caught after a delay..." in
+        // PrivacyAccessibilityServiceTest, which fails with this removed. Short enough to be
+        // irrelevant to normal use, long enough to clear a real dismiss-animation lag.
+        private const val UNLOCK_RECHECK_DELAY_MS = 500L
+    }
+
+    // public, not the inherited protected: PrivacyAccessibilityServiceTest calls this directly
+    // to simulate the real lifecycle (Robolectric.setupService() only drives the plain Service
+    // lifecycle, not this AccessibilityService-specific system binder callback). Idempotent, so
+    // widening it has no real downside.
+    public override fun onServiceConnected() {
+        super.onServiceConnected()
+        isServiceRunning = true
+        Log.i(TAG, "✅ Accessibility Service connected and active")
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        
+        // Only process window state changes (lock screen appearance)
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return
+        }
+        
+        try {
+            // Check if user has enabled this feature in app preferences
+            val preferenceManager = PreferenceManager.getInstance(applicationContext)
+            if (!preferenceManager.accessibilityServiceEnabled) {
+                Log.d(TAG, "Accessibility feature disabled in app preferences - ignoring event")
+                return
+            }
+            
+            val className = event.className?.toString() ?: ""
+
+            // Detect if this is a lock screen window. This has to fire and act
+            // immediately, with no confirmation step: by the time
+            // KeyguardManager.isKeyguardLocked() can be confirmed true, Android's own
+            // lock restriction already blocks changing sensor privacy, so gating on
+            // it here would make this service unable to ever do the one thing it
+            // exists for. isLockScreenClass() is the only gate, so its wording has to
+            // carry the whole burden of telling a real lock apart from the
+            // notification shade (see its own doc for why "StatusBar" was dropped).
+            if (isLockScreenClass(className)) {
+                val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                // Package name logged alongside the class name: isLockScreenClass() has no
+                // package scoping, matching by class name substring alone, so if a third-party
+                // app's own screen ever false-triggers this, the package name here is what would
+                // actually identify it - without this, a false-positive report would be very
+                // hard to track down to its cause.
+                Log.d(TAG, "🔒 Lock screen detected via Accessibility (class: $className, package: ${event.packageName}, isKeyguardLocked=${keyguardManager?.isKeyguardLocked})")
+                // Only the FIRST keyguard window of a lock cycle arms it. A lock screen emits
+                // several (bouncer, PIN pad, shade pulled down on it), and each re-trigger
+                // REPLACE-cancelled the job waiting out the user's lock delay and restarted that
+                // delay from zero, so a busy lock screen postponed the disable indefinitely.
+                val alreadyArmed = wasShowingKeyguard
+                wasShowingKeyguard = true
+                if (alreadyArmed) {
+                    Log.d(TAG, "🔒 Already armed for this lock - not restarting the lock delay")
+                } else {
+                    triggerEarlyPrivacyActions()
+                }
+            } else if (wasShowingKeyguard) {
+                // A non-keyguard window can appear while the device is genuinely still locked -
+                // an incoming call, the lock screen's own camera shortcut, an alarm, the
+                // notification shade pulled down ON the lock screen, an always-on-display or OEM
+                // overlay - none of which are an unlock. Confirmed against real keyguard state
+                // before acting, since (unlike the lock branch above) there is no timing
+                // pressure forcing a guess here. Proven by PrivacyAccessibilityServiceTest's
+                // first two tests, plus the self-heal and delayed-recheck tests below them.
+                val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                val isStillLocked = keyguardManager?.isKeyguardLocked ?: true // fail closed
+                if (isStillLocked) {
+                    Log.d(TAG, "Window changed (class: $className) but keyguard is still locked - not an unlock, staying armed")
+                    scheduleUnlockRecheck()
+                } else {
+                    Log.d(TAG, "🔓 Lock screen replaced by another window (class: $className), keyguard confirmed unlocked")
+                    wasShowingKeyguard = false
+                    triggerEarlyUnlockActions()
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing accessibility event", e)
+        }
+    }
+
+    // scheduleUnlockRecheck() below would otherwise build a fresh Handler on every call with no
+    // way to cancel an earlier one - several non-keyguard window events arriving
+    // in a row (a call screen, the notification shade, an animation tick) while
+    // wasShowingKeyguard stays true each queued their own independent 500ms callback, all
+    // running the same idempotent check. One stored Handler, with the pending callback replaced
+    // rather than piled onto, does the same job with at most one pending check at a time.
+    private val unlockRecheckHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * Catches a missed unlock when no further window-state-change event ever arrives to
+     * naturally re-trigger the check above. Re-reads real keyguard state once, after
+     * [UNLOCK_RECHECK_DELAY_MS] - if [wasShowingKeyguard] has already been cleared by then
+     * (a real window event caught it first, or a fresh lock cycle armed and is now tracking its
+     * own state), this is a no-op; isServiceRunning guards against acting after the service
+     * has been torn down.
+     */
+    private fun scheduleUnlockRecheck() {
+        unlockRecheckHandler.removeCallbacksAndMessages(null)
+        unlockRecheckHandler.postDelayed({
+            if (!isServiceRunning || !wasShowingKeyguard) {
+                return@postDelayed
+            }
+            val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            if (keyguardManager?.isKeyguardLocked == false) {
+                Log.d(TAG, "🔓 Keyguard caught up on delayed re-check (#A3) - no further window event ever arrived to trigger it naturally")
+                wasShowingKeyguard = false
+                triggerEarlyUnlockActions()
+            }
+        }, UNLOCK_RECHECK_DELAY_MS)
+    }
+
+    /**
+     * Detects if the window class name indicates a lock screen.
+     *
+     * Deliberately does NOT match "StatusBar" any more. It used to, and that let a
+     * genuine keyguard signal through on some devices - but the notification shade
+     * is rendered by the same StatusBar-lineage classes in AOSP, so it also fired
+     * this on a mere shade pull while the phone was unlocked and in active use.
+     * "Keyguard" and "LockScreen" are specific to the actual lock mechanism
+     * itself, and cover every real-world class name this project has seen recorded
+     * for lock-screen appearance, so dropping "StatusBar" removes the false
+     * positive without (as far as recorded evidence shows) losing real locks:
+     * - com.android.internal.policy.impl.keyguard.KeyguardViewMediator
+     * - com.android.systemui.keyguard.KeyguardViewMediator
+     * - Various manufacturer-specific Keyguard or LockScreen classes
+     * If a device's real keyguard reports through neither word, its logs will show
+     * no "Lock screen detected via Accessibility" line at all when it locks -
+     * that is the signal a device needs a name added here, not a wider net.
+     */
+    private fun isLockScreenClass(className: String): Boolean {
+        return className.contains("Keyguard", ignoreCase = true) ||
+               className.contains("LockScreen", ignoreCase = true)
+    }
+
+    // Queued with the default REPLACE, so this and the screen-off path never run the same lock twice.
+    private fun triggerEarlyPrivacyActions() {
+        try {
+            // Recorded unconditionally, before the sensorDisableInProgress check below - a plain
+            // volatile write can never interrupt anything mid-flight, so it needs none of that
+            // guard, same reasoning as recordUnlock() below. doWork() itself cannot be trusted to
+            // stamp this promptly enough on its own (real WorkManager dispatch latency sits
+            // between this line and doWork() actually starting).
+            PendingLockWork.recordLock(this)
+            if (PrivacyActionWorker.sensorDisableInProgress) {
+                // Another trigger for this same lock is already disabling sensors right now -
+                // REPLACE would cancel it mid-flight. Nothing to gain by racing it.
+                Log.d(TAG, "⏳ Sensor disable already in progress - not enqueuing a duplicate")
+                return
+            }
+
+            PrivacyActionWork.enqueue(
+                context = applicationContext,
+                isLocking = true,
+                isDeviceLocked = false,  // Device not fully locked yet
+                trigger = "accessibility_service",
+                reason = "Early Lock Detection (Accessibility)"
+            )
+
+
+            Log.i(TAG, "✅ Early privacy actions triggered (unique work: privacy_action_lock)")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to trigger early privacy actions", e)
+        }
+    }
+
+    /**
+     * Cancels whatever the lock-screen branch above may have armed, and triggers the normal
+     * unlock-side re-enable. This service has no ScreenStateReceiver-style broadcast to lean on
+     * for "the user is genuinely back" - this IS that signal, for this service's own independent
+     * lock-detection path.
+     */
+    private fun triggerEarlyUnlockActions() {
+        try {
+            // Recorded unconditionally, even when the cancel below is skipped - a plain
+            // timestamp write cannot interrupt anything mid-flight, so it needs none of that
+            // guard, and it is what lets a lock cycle this could not safely cancel for still
+            // notice the unlock at its own later checkpoint.
+            PendingLockWork.recordUnlock(this)
+            // Same guard the lock branch above already uses: a sensor disable that's actively
+            // running for THIS lock must not be interrupted mid-command.
+            if (!PrivacyActionWorker.sensorDisableInProgress) {
+                PendingLockWork.cancel(applicationContext, TAG, org.kaijinlab.hush.util.Constants.Work.NAME_LOCK)
+            }
+            // Without this, a 3rd unlock signal (this path firing moments after
+            // ScreenStateReceiver's own ACTION_USER_PRESENT already caught the same real unlock)
+            // could REPLACE-enqueue while the 2nd unlock's job is still mid-way through
+            // enableFeatures(), cancelling that in-flight coroutine and leaving sensors off after
+            // a real unlock. Checked after recordUnlock()/cancel() above, not before - both of
+            // those are still correct and safe to do even when the enqueue itself is about to be
+            // skipped as redundant.
+            if (PrivacyActionWorker.sensorEnableInProgress) {
+                Log.d(TAG, "⏳ Sensor enable already in progress - not enqueuing a duplicate")
+                return
+            }
+
+            PrivacyActionWork.enqueue(
+                context = applicationContext,
+                isLocking = false,
+                isDeviceLocked = false,
+                trigger = "accessibility_service",
+                reason = "Early Unlock Detection (Accessibility)"
+            )
+
+            Log.i(TAG, "✅ Early unlock actions triggered (unique work: privacy_action_unlock)")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to trigger early unlock actions", e)
+        }
+    }
+
+    override fun onInterrupt() {
+        Log.w(TAG, "Accessibility Service interrupted")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isServiceRunning = false
+        Log.i(TAG, "❌ Accessibility Service destroyed")
+    }
+}

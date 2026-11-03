@@ -1,0 +1,33 @@
+package org.kaijinlab.hush.privilege
+
+import android.content.Context
+import android.os.Build
+import org.kaijinlab.hush.util.LogManager
+import rikka.sui.Sui
+
+object SuiDetector {
+
+    private const val TAG = "SuiDetector"
+    private var logManager: LogManager? = null
+
+    fun detectAndInitialize(context: Context): Boolean {
+        if (logManager == null) {
+            logManager = LogManager.getInstance(context)
+        }
+
+        // Sui requires Android 6.0+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return false
+        }
+
+        try {
+            val packageName = context.packageName
+            return Sui.init(packageName)
+        } catch (e: Exception) {
+            logManager?.e(TAG, "Error detecting Sui: ${e.message}")
+            return false
+        }
+    }
+
+}
+
