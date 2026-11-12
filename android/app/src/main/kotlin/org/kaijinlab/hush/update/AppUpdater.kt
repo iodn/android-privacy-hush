@@ -26,7 +26,10 @@ import java.security.MessageDigest
 /** Public release metadata only. APKs are downloaded on request and installed by Android. */
 class AppUpdater(private val context: Context) {
     private val prefs = context.getSharedPreferences("hush_updates", Context.MODE_PRIVATE)
-    private val mutex = Mutex()
+    private companion object {
+        // Activity recreation must not run two writers against the shared APK cache.
+        val mutex = Mutex()
+    }
     private val directory get() = File(context.cacheDir, "updates").apply { mkdirs() }
     @Volatile private var phase = "idle"
     @Volatile private var error: String? = null
