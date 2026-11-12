@@ -28,6 +28,10 @@ class AppUpdaterTest {
     private lateinit var archive: PackageInfo
     private lateinit var candidate: GitHubRelease
     private lateinit var updater: AppUpdater
+    private val futureVersion: String get() {
+        val current = AppVersion.parse(org.kaijinlab.hush.BuildConfig.VERSION_NAME)!!
+        return "${current.major}.${current.minor + 1}.0"
+    }
     private fun signer(info: PackageInfo, value: String) {
         val signature = Signature(value)
         if (Build.VERSION.SDK_INT >= 28) {
@@ -45,14 +49,14 @@ class AppUpdaterTest {
         }
         shadowOf(context.packageManager).installPackage(installed)
         archive = PackageInfo().apply {
-            packageName = context.packageName; versionCode = 8; versionName = "1.6.0"
+            packageName = context.packageName; versionCode = 8; versionName = futureVersion
             if (Build.VERSION.SDK_INT >= 28) longVersionCode = 8
             signer(this, "001122")
             applicationInfo = ApplicationInfo().apply { packageName = context.packageName; minSdkVersion = 26 }
         }
         shadowOf(context.packageManager).setPackageArchiveInfo(file.path, archive)
         val hash = MessageDigest.getInstance("SHA-256").digest(file.readBytes()).joinToString("") { "%02x".format(it) }
-        candidate = GitHubRelease("v1.6.0", "1.6.0", "Fixes", "Hush-1.6.0-arm64.apk", file.length(), hash, "https://github.com/iodn/android-privacy-hush/releases/download/v1.6.0/Hush-1.6.0-arm64.apk")
+        candidate = GitHubRelease("v$futureVersion", futureVersion, "Fixes", "Hush-$futureVersion-arm64.apk", file.length(), hash, "https://github.com/iodn/android-privacy-hush/releases/download/v$futureVersion/Hush-$futureVersion-arm64.apk")
         updater = AppUpdater(context)
     }
     @Test fun `matching signed newer APK is accepted`() { updater.verify(file, candidate) }
@@ -77,7 +81,7 @@ class AppUpdaterTest {
         assertThrows(IllegalArgumentException::class.java) { updater.verify(file, candidate) }
     }
     @Test fun `a different APK version is refused`() {
-        archive.versionName = "1.7.0"
+        archive.versionName = "0.0.1"
         assertThrows(IllegalArgumentException::class.java) { updater.verify(file, candidate) }
     }
     @Test fun `incompatible Android minimum is refused`() {
@@ -85,13 +89,13 @@ class AppUpdaterTest {
         assertThrows(IllegalArgumentException::class.java) { updater.verify(file, candidate) }
     }
     @Test fun `an invalid cached APK can be downloaded again after installation is refused`() = runBlocking {
-        val json = org.json.JSONObject().put("tag_name", "v1.6.0").put("draft", false).put("prerelease", false)
+        val json = org.json.JSONObject().put("tag_name", "v$futureVersion").put("draft", false).put("prerelease", false)
             .put("assets", org.json.JSONArray().put(org.json.JSONObject()
-                .put("name", "Hush-1.6.0-universal.apk").put("size", candidate.size)
+                .put("name", "Hush-$futureVersion-universal.apk").put("size", candidate.size)
                 .put("digest", "sha256:" + candidate.sha256)
-                .put("browser_download_url", "https://github.com/iodn/android-privacy-hush/releases/download/v1.6.0/Hush-1.6.0-universal.apk")))
+                .put("browser_download_url", "https://github.com/iodn/android-privacy-hush/releases/download/v$futureVersion/Hush-$futureVersion-universal.apk")))
         context.getSharedPreferences("hush_updates", 0).edit().putString("release", json.toString()).commit()
-        val cached = File(context.cacheDir, "updates/Hush-1.6.0-universal.apk")
+        val cached = File(context.cacheDir, "updates/Hush-$futureVersion-universal.apk")
         cached.parentFile!!.mkdirs()
         cached.writeText("truncated")
         val activity = org.robolectric.Robolectric.buildActivity(android.app.Activity::class.java).get()
