@@ -33,6 +33,18 @@ class ConnectionStateChecker(
     companion object {
         private const val TAG = "hush-ConnectionStateChecker"
 
+        // Compiled once per process instead of once per connectivity check on the lock path.
+        private val WIFI_CONNECTED = Regex("\\bWIFI\\b[^\\n]*\\bCONNECTED\\b")
+        private val HOTSPOT_INTERFACE =
+            Regex("(?:wlan\\d+|softap\\d+|ap\\d+|swlan0)\\s*-\\s*TetheredState", RegexOption.IGNORE_CASE)
+
+        private val VALIDATED_NETWORK = Regex("\\bVALIDATED\\b")
+
+        internal fun parseWifiConnected(output: String): Boolean = output.uppercase().lineSequence().any { line ->
+            WIFI_CONNECTED.containsMatchIn(line) ||
+                ("TRANSPORTS: WIFI" in line && VALIDATED_NETWORK.containsMatchIn(line))
+        }
+
         // Split out from isLocationInUse() so it can be unit-tested without a real device: the
         // awk command it classifies can only run through a real shell, but the classification
         // itself is plain string logic. See ConnectionStateCheckerTest.
@@ -52,7 +64,7 @@ class ConnectionStateChecker(
             PrivacyFeature.BLUETOOTH -> isBluetoothConnected()
             PrivacyFeature.MICROPHONE -> isMicrophoneInUse()
             PrivacyFeature.LOCATION -> isLocationInUse()
-            PrivacyFeature.MOBILE_DATA -> isMediaPlaying()
+            PrivacyFeature.MOBILE_DATA -> isMediaPlaying() || isMicrophoneInUse()
             // For features where we can't reliably detect usage, return false
             // (they will be disabled normally)
             PrivacyFeature.NFC,
@@ -75,16 +87,14 @@ class ConnectionStateChecker(
                 return false
             }
 
-            val output = result.output.joinToString(" ").uppercase()
+            val output = result.output.joinToString("\n").uppercase()
             
             // Look for patterns indicating WiFi is connected
             // Pattern 1: "WIFI CONNECTED" from NetworkAgentInfo
             // Pattern 2: "Transports: WIFI" with "VALIDATED" (active connection)
-            val isConnected = output.contains("WIFI CONNECTED") ||
-                             output.contains("WIFI.*CONNECTED".toRegex()) ||
-                             (output.contains("TRANSPORTS: WIFI") && output.contains("VALIDATED"))
+            val isConnected = parseWifiConnected(output)
 
-            Log.i(TAG, "📶 WiFi connection check: ${if (isConnected) "CONNECTED" else "NOT CONNECTED"}")
+            Log.i(TAG, "WiFi connection check: ${if (isConnected) "CONNECTED" else "NOT CONNECTED"}")
             isConnected
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -115,21 +125,20 @@ class ConnectionStateChecker(
             )
 
             if (!result.success) {
-                Log.w(TAG, "📡 Failed to check hotspot state via dumpsys tethering")
+                Log.w(TAG, "Failed to check hotspot state via dumpsys tethering")
                 return false
             }
 
             val output = result.output.joinToString("\n")
             // Tetherable WiFi interfaces per AOSP: wlan\d, softap\d, ap\d, swlan0
-            val isActive = Regex("(?:wlan\\d+|softap\\d+|ap\\d+|swlan0)\\s*-\\s*TetheredState", RegexOption.IGNORE_CASE)
-                .containsMatchIn(output)
+            val isActive = HOTSPOT_INTERFACE.containsMatchIn(output)
 
-            Log.i(TAG, "📡 Hotspot check: ${if (isActive) "ACTIVE" else "NOT ACTIVE"}")
+            Log.i(TAG, "Hotspot check: ${if (isActive) "ACTIVE" else "NOT ACTIVE"}")
             isActive
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "📡 Error checking hotspot state", e)
+            Log.e(TAG, "Error checking hotspot state", e)
             false
         }
     }
@@ -142,14 +151,14 @@ class ConnectionStateChecker(
                 ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT)
                     != PackageManager.PERMISSION_GRANTED
             ) {
-                Log.w(TAG, "🔵 BLUETOOTH_CONNECT not granted - cannot check Bluetooth connection state")
+                Log.w(TAG, "BLUETOOTH_CONNECT not granted - cannot check Bluetooth connection state")
                 return false
             }
 
             val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
             val adapter = bluetoothManager?.adapter
             if (adapter == null || !adapter.isEnabled) {
-                Log.d(TAG, "🔵 Bluetooth adapter unavailable or off - NOT CONNECTED")
+                Log.d(TAG, "Bluetooth adapter unavailable or off - NOT CONNECTED")
                 return false
             }
 
@@ -165,13 +174,13 @@ class ConnectionStateChecker(
                 adapter.getProfileConnectionState(profile) == BluetoothProfile.STATE_CONNECTED
             }?.second ?: leAudioOutput()
 
-            Log.i(TAG, "🔵 Bluetooth connection check: ${if (connectedOn != null) "CONNECTED ($connectedOn)" else "NOT CONNECTED"}")
+            Log.i(TAG, "Bluetooth connection check: ${if (connectedOn != null) "CONNECTED ($connectedOn)" else "NOT CONNECTED"}")
             connectedOn != null
         } catch (e: SecurityException) {
-            Log.w(TAG, "🔵 Missing Bluetooth permission when checking connection state", e)
+            Log.w(TAG, "Missing Bluetooth permission when checking connection state", e)
             false
         } catch (e: Exception) {
-            Log.e(TAG, "🔵 Error checking Bluetooth connection state", e)
+            Log.e(TAG, "Error checking Bluetooth connection state", e)
             false
         }
     }
@@ -287,22 +296,22 @@ class ConnectionStateChecker(
                 // Include the shell's own error (e.g. "awk: not found" on a device without it) -
                 // the previous version of this log dropped it, leaving no way to tell why this
                 // failed from the logs alone.
-                Log.w(TAG, "📍 Failed to check location usage state via dumpsys appops: ${result.error ?: "no error detail"}")
+                Log.w(TAG, "Failed to check location usage state via dumpsys appops: ${result.error ?: "no error detail"}")
                 return false
             }
 
             val output = result.output.joinToString("\n")
             if (output.contains("NOBLOCKS")) {
-                Log.w(TAG, "📍 dumpsys appops never showed a location op block at all - detection may not work on this Android version/OEM, treating as not in use")
+                Log.w(TAG, "dumpsys appops never showed a location op block at all - detection may not work on this Android version/OEM, treating as not in use")
             }
             val isInUse = parseLocationInUseOutput(output)
 
-            Log.i(TAG, "📍 Location usage check: ${if (isInUse) "IN USE" else "NOT IN USE"}")
+            Log.i(TAG, "Location usage check: ${if (isInUse) "IN USE" else "NOT IN USE"}")
             isInUse
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "📍 Error checking location usage state", e)
+            Log.e(TAG, "Error checking location usage state", e)
             false
         }
     }
@@ -328,10 +337,10 @@ class ConnectionStateChecker(
         return try {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             val playing = audioManager?.isMusicActive ?: false
-            Log.i(TAG, "🎵 Media playback check: ${if (playing) "PLAYING" else "NOT PLAYING"}")
+            Log.i(TAG, "Media playback check: ${if (playing) "PLAYING" else "NOT PLAYING"}")
             playing
         } catch (e: Exception) {
-            Log.e(TAG, "🎵 Error checking media playback", e)
+            Log.e(TAG, "Error checking media playback", e)
             false
         }
     }
@@ -349,7 +358,7 @@ class ConnectionStateChecker(
                            mode == AudioManager.MODE_IN_COMMUNICATION
 
                 if (inUse) {
-                    Log.i(TAG, "🎤 Microphone in use (audio mode: $mode)")
+                    Log.i(TAG, "Microphone in use (audio mode: $mode)")
                 }
 
                 inUse

@@ -28,15 +28,15 @@ abstract class SensorPrivacyToggle(
     // Enable = allow access (privacy off), disable = block access (privacy on).
     // user_id 0 is the primary user. Android refuses this change once the device is locked.
     override val enableCommands = listOf(
-        CommandSet("cmd sensor_privacy disable 0 $sensorName", description = "Sensor privacy control (Android 12+)")
+        CommandSet("cmd sensor_privacy disable 0 $sensorName")
     )
 
     override val disableCommands = listOf(
-        CommandSet("cmd sensor_privacy enable 0 $sensorName", description = "Sensor privacy control (Android 12+)")
+        CommandSet("cmd sensor_privacy enable 0 $sensorName")
     )
 
     override val statusCommands = listOf(
-        CommandSet("dumpsys sensor_privacy", description = "Check sensor privacy status")
+        CommandSet("dumpsys sensor_privacy")
     )
 
     override fun parseStatusOutput(output: String): FeatureState =

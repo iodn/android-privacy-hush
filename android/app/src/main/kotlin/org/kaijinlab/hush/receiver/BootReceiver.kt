@@ -8,7 +8,6 @@ import android.os.Looper
 import android.util.Log
 import org.kaijinlab.hush.service.PrivacyMonitorService
 import org.kaijinlab.hush.util.Constants
-import org.kaijinlab.hush.util.PreferenceManager
 
 class BootReceiver : BroadcastReceiver() {
 
@@ -21,14 +20,14 @@ class BootReceiver : BroadcastReceiver() {
         
         when (intent.action) {
             Intent.ACTION_BOOT_COMPLETED -> {
-                Log.i(TAG, "🚀 Device boot completed - checking service restart")
+                Log.i(TAG, "Device boot completed - checking service restart")
                 org.kaijinlab.hush.util.DeferredActionWork.newBoot(context)
                 handleBootCompleted(context)
             }
             Intent.ACTION_MY_PACKAGE_REPLACED -> handleBootCompleted(context)
             
             else -> {
-                Log.w(TAG, "⚠️ Unexpected boot intent action: ${intent.action}")
+                Log.w(TAG, "Unexpected boot intent action: ${intent.action}")
             }
         }
     }
@@ -38,7 +37,7 @@ class BootReceiver : BroadcastReceiver() {
             // Apply 300ms debounce to prevent race conditions as requested
             val pending = goAsync()
             Handler(Looper.getMainLooper()).postDelayed({
-                try { restartServiceIfEnabled(context) } finally { pending?.finish() }
+                try { restartService(context) } finally { pending?.finish() }
             }, Constants.BootReceiver.DEBOUNCE_DELAY_MS)
             
         } catch (e: Exception) {
@@ -46,15 +45,12 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
     
-    private fun restartServiceIfEnabled(context: Context) {
+    private fun restartService(context: Context) {
         try {
-            val preferenceManager = PreferenceManager.getInstance(context)
-            // Always ensure background service is enabled and start it
-            preferenceManager.backgroundServiceEnabled = true
-
-            Log.i(TAG, "✅ Background service always enabled - restarting PrivacyMonitorService")
+            // The monitor service is always on: it is what applies the user's protection.
+            Log.i(TAG, "Restarting PrivacyMonitorService")
             PrivacyMonitorService.start(context)
-            Log.i(TAG, "🔄 Service restart requested after boot - will apply initial privacy state")
+            Log.i(TAG, "Service restart requested after boot - will apply initial privacy state")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to restart service after boot", e)

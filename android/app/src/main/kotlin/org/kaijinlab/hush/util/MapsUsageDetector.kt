@@ -9,16 +9,24 @@ internal data class MapsUsage(val active: Boolean, val verified: Boolean)
 internal class MapsUsageDetector(private val context: Context, private val root: RootManager) {
     companion object {
         const val PACKAGE = "com.google.android.apps.maps"
+
+        // Compiled once: these run per ServiceRecord and per output line on every check.
+        private val SERVICE_RECORD_HEADER = Regex("(?m)^[ \\t]*\\* ServiceRecord")
+        private val IS_FOREGROUND = Regex("\\bisForeground=true\\b")
+        private val SERVICE_TYPE = Regex("(?:types|foregroundServiceType)=(0x[0-9a-fA-F]+|[0-9]+)")
+        private val NAVIGATION_WORD = Regex("navigation|guidance", RegexOption.IGNORE_CASE)
+        private val APPOP_OP_HEADER = Regex("^([ \\t]*)([A-Z][A-Z_]+)(?: \\(|:)")
+
         internal fun hasNavigationService(output: String): Boolean =
-            output.split(Regex("(?m)^[ \\t]*\\* ServiceRecord")).any { service ->
-                if (!Regex("\\bisForeground=true\\b").containsMatchIn(service)) false
+            output.split(SERVICE_RECORD_HEADER).any { service ->
+                if (!IS_FOREGROUND.containsMatchIn(service)) false
                 else {
-                    val type = Regex("(?:types|foregroundServiceType)=(0x[0-9a-fA-F]+|[0-9]+)")
+                    val type = SERVICE_TYPE
                         .find(service)?.groupValues?.get(1)?.let {
                             if (it.startsWith("0x")) it.drop(2).toLongOrNull(16) else it.toLongOrNull()
                         }
                     type == null || type == 0L || type.and(8L) != 0L ||
-                        Regex("navigation|guidance", RegexOption.IGNORE_CASE).containsMatchIn(service.lineSequence().firstOrNull().orEmpty())
+                        NAVIGATION_WORD.containsMatchIn(service.lineSequence().firstOrNull().orEmpty())
                 }
             }
 
@@ -26,7 +34,7 @@ internal class MapsUsageDetector(private val context: Context, private val root:
             var locationOp = false
             var opIndent = 0
             for (line in output.lineSequence()) {
-                val header = Regex("^([ \\t]*)([A-Z][A-Z_]+)(?: \\(|:)").find(line)
+                val header = APPOP_OP_HEADER.find(line)
                 if (header != null) {
                     opIndent = header.groupValues[1].length
                     locationOp = header.groupValues[2] in setOf("COARSE_LOCATION", "FINE_LOCATION", "MONITOR_HIGH_POWER_LOCATION")

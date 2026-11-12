@@ -5,7 +5,6 @@ import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import org.kaijinlab.hush.service.PrivacyMonitorService
-import org.kaijinlab.hush.util.PreferenceManager
 
 class ServiceHealthWorker(
     context: Context,
@@ -19,10 +18,6 @@ class ServiceHealthWorker(
     override suspend fun doWork(): Result {
         return try {
             Log.d(TAG, "Checking service health...")
-
-            val preferenceManager = PreferenceManager.getInstance(applicationContext)
-            // Always ensure background service is enabled
-            preferenceManager.backgroundServiceEnabled = true
 
             val isServiceRunning = isServiceRunning()
 

@@ -33,6 +33,13 @@ class PrivacyMonitorService : Service() {
 
         fun isRunning(): Boolean = isServiceRunning
 
+        fun refreshTimerCountdown() {
+            activeService?.let { service ->
+                service.timerHandler.removeCallbacks(service.timerCountdown)
+                service.timerHandler.post(service.timerCountdown)
+            }
+        }
+
         fun showCountdown(owner: java.util.UUID, text: String?) {
             val service = activeService ?: return
             synchronized(service) {
@@ -69,11 +76,31 @@ class PrivacyMonitorService : Service() {
         }
     }
     
+    private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val timerOwner = java.util.UUID.randomUUID()
+    private val timerCountdown = object : Runnable {
+        override fun run() {
+            val prefs = org.kaijinlab.hush.util.PreferenceManager.getInstance(this@PrivacyMonitorService)
+            val next = org.kaijinlab.hush.util.DeferredActionWork.nextDeadline(this@PrivacyMonitorService)
+            if (!prefs.showCountdown || next == null || !prefs.isGlobalPrivacyEnabled && next.first) {
+                showCountdown(timerOwner, null)
+                return
+            }
+            val seconds = maxOf(0L, next.second - android.os.SystemClock.elapsedRealtime() + 999) / 1000
+            showCountdown(timerOwner, "${if (next.first) "Lock" else "Unlock"} actions in ${seconds}s")
+            timerHandler.postDelayed(this, 1000L)
+        }
+    }
+
     @Volatile private var countdownText: String? = null
     private var countdownOwner: java.util.UUID? = null
 
     private val protectionListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == Constants.Preferences.KEY_SHOW_COUNTDOWN) refreshTimerCountdown()
         if (key == Constants.Preferences.KEY_GLOBAL_PRIVACY_ENABLED) {
+            if (!org.kaijinlab.hush.util.PreferenceManager.getInstance(this).isGlobalPrivacyEnabled) {
+                org.kaijinlab.hush.util.DeferredActionWork.cancelTimers(this, true)
+            }
             countdownText = null
             getSystemService(NotificationManager::class.java).notify(Constants.ServiceNotification.NOTIFICATION_ID, createNotification())
         }
@@ -87,7 +114,8 @@ class PrivacyMonitorService : Service() {
         super.onCreate()
         isServiceRunning = true
         activeService = this
-        Log.i(TAG, "🚀 Privacy Monitor Service created")
+        refreshTimerCountdown()
+        Log.i(TAG, "Privacy Monitor Service created")
 
         try {
             createNotificationChannel()
@@ -104,22 +132,23 @@ class PrivacyMonitorService : Service() {
             // Apply initial privacy state based on current screen lock status
             applyInitialPrivacyState()
 
-            Log.i(TAG, "✅ Privacy Monitor Service initialized successfully")
+            Log.i(TAG, "Privacy Monitor Service initialized successfully")
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to initialize Privacy Monitor Service", e)
+            Log.e(TAG, "Failed to initialize Privacy Monitor Service", e)
             isServiceRunning = false
             stopSelf()
         }
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "🔄 Privacy Monitor Service started (flags=$flags, startId=$startId)")
+        Log.i(TAG, "Privacy Monitor Service started (flags=$flags, startId=$startId)")
         return START_STICKY
     }
     
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
+        timerHandler.removeCallbacksAndMessages(null)
         if (activeService === this) activeService = null
         Log.d(TAG, "Privacy Monitor Service destroyed")
 
@@ -186,7 +215,7 @@ class PrivacyMonitorService : Service() {
             val isScreenLocked = isScreenCurrentlyLocked()
             val reason = "Service Initialization"
 
-            Log.i(TAG, "🔍 Checking initial screen state: ${if (isScreenLocked) "LOCKED" else "UNLOCKED"}")
+            Log.i(TAG, "Checking initial screen state: ${if (isScreenLocked) "LOCKED" else "UNLOCKED"}")
 
             // Apply appropriate privacy actions based on current screen state
             triggerInitialPrivacyAction(!isScreenLocked, reason)
@@ -239,7 +268,7 @@ class PrivacyMonitorService : Service() {
             if (isLocking && PrivacyActionWorker.sensorDisableInProgress) {
                 // Another trigger is already disabling sensors for this lock - REPLACE would
                 // cancel it mid-flight.
-                Log.d(TAG, "⏳ Sensor disable already in progress - not replacing it")
+                Log.d(TAG, "Sensor disable already in progress - not replacing it")
                 return
             }
 
@@ -267,7 +296,7 @@ class PrivacyMonitorService : Service() {
                 // after recordUnlock()/cancel() above - both are still correct and safe to do
                 // even when the enqueue itself is about to be skipped as redundant.
                 if (PrivacyActionWorker.sensorEnableInProgress) {
-                    Log.d(TAG, "⏳ Sensor enable already in progress - not enqueuing a duplicate")
+                    Log.d(TAG, "Sensor enable already in progress - not enqueuing a duplicate")
                     return
                 }
             }
@@ -281,7 +310,7 @@ class PrivacyMonitorService : Service() {
                 trigger = PrivacyActionWork.TRIGGER_SERVICE_INIT,
                 reason = reason
             )
-            Log.i(TAG, "🔄 Initial privacy action enqueued (unique: $workName): ${if (isUnlocking) "unlock" else "lock"} actions (deviceLocked=$isDeviceLocked)")
+            Log.i(TAG, "Initial privacy action enqueued (unique: $workName): ${if (isUnlocking) "unlock" else "lock"} actions (deviceLocked=$isDeviceLocked)")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to trigger initial privacy action", e)

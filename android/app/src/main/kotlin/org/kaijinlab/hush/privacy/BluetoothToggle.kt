@@ -5,23 +5,29 @@ import org.kaijinlab.hush.root.RootManager
 
 open class BluetoothToggle(rootManager: RootManager) : BasePrivacyToggle(rootManager) {
 
+    companion object {
+        // Compiled once: parseStatusOutput runs on every read-back attempt (up to 14 per switch).
+        private val ADAPTER_STATE = Regex("state:\\s*([a-z_]+)")
+        private val ENABLED_FLAG = Regex("enabled:\\s*(true|false)")
+    }
+
     override val feature = PrivacyFeature.BLUETOOTH
     override val featureName = "Bluetooth"
 
     // No bluetooth_on fallback: the Bluetooth service only stores that key, and it reads 2 while
     // Airplane Mode holds Bluetooth off. Below Android 8.1 svc has no bluetooth command at all.
     override val enableCommands = listOf(
-        CommandSet("svc bluetooth enable", description = "Service control method")
+        CommandSet("svc bluetooth enable")
     )
 
     override val disableCommands = listOf(
-        CommandSet("svc bluetooth disable", description = "Service control method")
+        CommandSet("svc bluetooth disable")
     )
 
     // The key only for a backend that may not dump services (Dhizuku); nothing here writes it.
     override val statusCommands = listOf(
-        CommandSet("dumpsys bluetooth_manager | grep -E '^ *(enabled|state):'", description = "Bluetooth service state"),
-        CommandSet("settings get global bluetooth_on", description = "Stored Bluetooth state")
+        CommandSet("dumpsys bluetooth_manager | grep -E '^ *(enabled|state):'"),
+        CommandSet("settings get global bluetooth_on")
     )
 
     // The adapter reads OFF, then TURNING_ON, for up to a couple of seconds after svc returns.
@@ -31,14 +37,14 @@ open class BluetoothToggle(rootManager: RootManager) : BasePrivacyToggle(rootMan
     // BLE_ON is classic Bluetooth off; a stored 2 is "on after Airplane Mode".
     override fun parseStatusOutput(output: String): FeatureState {
         val text = output.lowercase()
-        Regex("state:\\s*([a-z_]+)").find(text)?.let {
+        ADAPTER_STATE.find(text)?.let {
             return when (it.groupValues[1]) {
                 "on" -> FeatureState.ENABLED
                 "off", "ble_on" -> FeatureState.DISABLED
                 else -> FeatureState.UNKNOWN
             }
         }
-        Regex("enabled:\\s*(true|false)").find(text)?.let {
+        ENABLED_FLAG.find(text)?.let {
             return if (it.groupValues[1] == "true") FeatureState.ENABLED else FeatureState.DISABLED
         }
         return when (output.trim()) {

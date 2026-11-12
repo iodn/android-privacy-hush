@@ -18,18 +18,17 @@ open class AirplaneModeToggle(rootManager: RootManager) : BasePrivacyToggle(root
     private fun commandsFor(on: Boolean): List<CommandSet> {
         val broadcast = CommandSet(
             "[ \"\$(id -u)\" = 0 ] && settings put global airplane_mode_on ${if (on) 1 else 0} && " +
-                "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state $on",
-            description = "Settings + broadcast (root only)"
+                "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state $on"
         )
         if (Build.VERSION.SDK_INT < 28) return listOf(broadcast)
         return listOf(
-            CommandSet("cmd connectivity airplane-mode ${if (on) "enable" else "disable"}", description = "Connectivity service"),
+            CommandSet("cmd connectivity airplane-mode ${if (on) "enable" else "disable"}"),
             broadcast
         )
     }
 
     override val statusCommands = listOf(
-        CommandSet("settings get global airplane_mode_on", description = "Check airplane mode status")
+        CommandSet("settings get global airplane_mode_on")
     )
 
     override fun parseStatusOutput(output: String): FeatureState {

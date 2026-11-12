@@ -211,20 +211,13 @@ class PrivacyActionWorkerDoWorkTest {
 
         var featureClock = 0L
         val timedActions = mutableListOf<Pair<PrivacyFeature, Long>>()
-        val waits = mutableListOf<Long>()
         val deferred = mutableListOf<Triple<Set<PrivacyFeature>, Boolean, Long>>()
         var onDefer: () -> Unit = {}
         override fun deferFeatures(features: Set<PrivacyFeature>, locking: Boolean, delayMillis: Long, generation: Long) {
             onDefer()
             deferred += Triple(features, locking, delayMillis)
         }
-        var onFeatureWait: () -> Unit = {}
         override fun actionTimeMillis(): Long = featureClock
-        override suspend fun awaitFeatureDelay(millis: Long) {
-            waits += millis
-            featureClock += millis
-            onFeatureWait()
-        }
 
         var statusError: Exception? = null
         var onStatusRead: () -> Unit = {}
@@ -289,11 +282,19 @@ class PrivacyActionWorkerDoWorkTest {
             })
             .build() as FakeWorker
 
+    private fun dueInput(locking: Boolean, vararg features: PrivacyFeature): androidx.work.Data {
+        org.kaijinlab.hush.initWorkManagerWithoutRealWork(context)
+        val work = org.kaijinlab.hush.util.DeferredActionWork
+        return work.buildRequest(features.toSet(), locking, 0, work.generation(context)).workSpec.input
+    }
+
     private fun recordLock() {
+        org.kaijinlab.hush.util.DeferredActionWork.recordState(context, true)
         PrivacyActionWorker.lastLockAtMillis = ++clock
     }
 
     private fun recordUnlock() {
+        org.kaijinlab.hush.util.DeferredActionWork.recordState(context, false)
         PrivacyActionWorker.lastUnlockAtMillis = ++clock
     }
 
@@ -771,6 +772,18 @@ class PrivacyActionWorkerDoWorkTest {
         runBlocking { unticked.doWork() }
 
         assertEquals("with the box unticked, playing media must not save it", listOf(PrivacyFeature.MOBILE_DATA), unticked.disabled)
+    }
+
+    @Test fun `mobile data stays on during a communication even without music`() = runBlocking {
+        val audio = context.getSystemService(AudioManager::class.java)
+        audio.mode = AudioManager.MODE_IN_COMMUNICATION
+        shadowOf(audio).setIsMusicActive(false)
+        prefs.setFeatureDisableOnLock(PrivacyFeature.MOBILE_DATA, true)
+        prefs.setFeatureOnlyIfUnused(PrivacyFeature.MOBILE_DATA, true)
+        recordLock()
+        val lock = worker(true).apply { realInUseCheck = true }
+        lock.doWork()
+        assertTrue(lock.disabled.isEmpty())
     }
 
     @Test
@@ -1397,6 +1410,7 @@ class PrivacyActionWorkerDoWorkTest {
         recordLock()
         val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
         reblock.states[PrivacyFeature.WIFI] = FeatureState.ENABLED
+        prefs.addFeaturesOffSinceUnlock(setOf(PrivacyFeature.WIFI))
         runBlocking { kotlinx.coroutines.withTimeout(5_000) { reblock.doWork() } }
 
         assertTrue(reblock.disabled.contains(PrivacyFeature.WIFI))
@@ -1777,31 +1791,34 @@ class PrivacyActionWorkerDoWorkTest {
         assertTrue("the already-off line is there", lines.any { it.contains("${PrivacyFeature.WIFI.displayName} was already off") })
         assertTrue("and no '0/0 disabled' line, was: ${lines.filter { it.contains("completed") }}", lines.none { it.contains("Lock action completed: 0/0") })
     }
-    @Test fun `each lock feature runs at its own deadline and defaults still apply`() {
+    @Test fun `each lock feature schedules its own wakeup deadline and defaults still apply`() = runBlocking {
         prefs.lockDelaySeconds = 10
         listOf(PrivacyFeature.WIFI, PrivacyFeature.BLUETOOTH, PrivacyFeature.NFC).forEach { prefs.setFeatureDisableOnLock(it, true) }
         prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
         prefs.setFeatureDelayOverride(PrivacyFeature.NFC, true, 20)
         recordLock()
-        val lock = worker(isLocking = true)
-        runBlocking { lock.doWork() }
-        assertEquals(listOf(PrivacyFeature.WIFI to 5000L, PrivacyFeature.BLUETOOTH to 10000L, PrivacyFeature.NFC to 20000L), lock.timedActions)
-        assertEquals(listOf(5000L, 5000L, 10000L), lock.waits)
+        val lock = worker(true)
+        lock.doWork()
+        assertEquals(listOf(
+            Triple(setOf(PrivacyFeature.WIFI), true, 5000L),
+            Triple(setOf(PrivacyFeature.BLUETOOTH), true, 10000L),
+            Triple(setOf(PrivacyFeature.NFC), true, 20000L)
+        ), lock.deferred)
+        assertTrue(lock.disabled.isEmpty())
     }
 
-    @Test fun `a slow action does not add its duration to the next feature delay`() {
+    @Test fun `a slow action does not add its duration to the next feature delay`() = runBlocking {
         prefs.lockDelaySeconds = 10
-        listOf(PrivacyFeature.WIFI, PrivacyFeature.BLUETOOTH, PrivacyFeature.NFC).forEach { prefs.setFeatureDisableOnLock(it, true) }
-        prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
-        prefs.setFeatureDelayOverride(PrivacyFeature.NFC, true, 20)
+        listOf(PrivacyFeature.CAMERA, PrivacyFeature.WIFI).forEach { prefs.setFeatureDisableOnLock(it, true) }
         recordLock()
-        val lock = worker(isLocking = true)
-        lock.beforeDisable = { if (PrivacyFeature.WIFI in it) lock.featureClock += 7000L }
-        runBlocking { lock.doWork() }
-        assertEquals(listOf(PrivacyFeature.WIFI to 5000L, PrivacyFeature.BLUETOOTH to 12000L, PrivacyFeature.NFC to 20000L), lock.timedActions)
+        val lock = worker(true)
+        lock.beforeDisable = { lock.featureClock += 7000L }
+        lock.doWork()
+        assertEquals(listOf(PrivacyFeature.CAMERA), lock.disabled)
+        assertEquals(listOf(Triple(setOf(PrivacyFeature.WIFI), true, 3000L)), lock.deferred)
     }
 
-    @Test fun `unlock timers restore independently and preserve later restoration records`() {
+    @Test fun `unlock timers restore independently and preserve later restoration records`() = runBlocking {
         prefs.unlockDelaySeconds = 1
         val selected = listOf(PrivacyFeature.NFC, PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)
         selected.forEach { prefs.setFeatureEnableOnUnlock(it, true) }
@@ -1809,74 +1826,82 @@ class PrivacyActionWorkerDoWorkTest {
         prefs.setFeatureDelayOverride(PrivacyFeature.MICROPHONE, false, 5)
         prefs.addFeaturesOffSinceUnlock(selected)
         recordUnlock()
-        val unlock = worker(isLocking = false)
-        unlock.screenLocked = false
-        unlock.beforeEnable = {
-            if (PrivacyFeature.NFC in it) assertTrue(prefs.featuresOffSinceUnlock.containsAll(listOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)))
+        val unlock = worker(false).apply { screenLocked = false }
+        unlock.doWork()
+        assertEquals(listOf(1000L, 2000L, 5000L), unlock.deferred.map { it.third })
+        assertTrue(unlock.enabled.isEmpty())
+        for ((index, feature) in selected.withIndex()) {
+            val due = worker(false, input = dueInput(false, feature)).apply { screenLocked = false }
+            due.doWork()
+            assertEquals(listOf(feature), due.enabled)
+            assertEquals(selected.drop(index + 1).toSet(), prefs.featuresOffSinceUnlock)
         }
-        runBlocking { unlock.doWork() }
-        assertEquals(listOf(PrivacyFeature.NFC to 1000L, PrivacyFeature.CAMERA to 2000L, PrivacyFeature.MICROPHONE to 5000L), unlock.timedActions)
-        assertTrue(prefs.featuresOffSinceUnlock.isEmpty())
     }
 
-    @Test fun `unlock during a custom lock delay cancels remaining features`() {
+    @Test fun `unlock during a custom lock delay cancels remaining features`() = runBlocking {
         prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
         prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
         recordLock()
-        val lock = worker(isLocking = true)
-        lock.onFeatureWait = { recordUnlock(); lock.screenLocked = false }
-        runBlocking { lock.doWork() }
-        assertTrue(lock.disabled.isEmpty())
+        val lock = worker(true)
+        lock.doWork()
+        val input = dueInput(true, PrivacyFeature.WIFI)
+        recordUnlock()
+        val due = worker(true, input = input).apply { screenLocked = false }
+        due.doWork()
+        assertTrue(due.disabled.isEmpty())
         assertFalse(PrivacyActionWorker.sensorDisableInProgress)
     }
 
-    @Test fun `pausing protection during a custom delay prevents the lock action`() {
+    @Test fun `pausing protection during a custom delay prevents the lock action`() = runBlocking {
         prefs.setFeatureDisableOnLock(PrivacyFeature.WIFI, true)
         prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, true, 5)
         recordLock()
-        val lock = worker(isLocking = true)
-        lock.onFeatureWait = { prefs.isGlobalPrivacyEnabled = false }
-        runBlocking { lock.doWork() }
-        assertTrue(lock.disabled.isEmpty())
+        worker(true).doWork()
+        val input = dueInput(true, PrivacyFeature.WIFI)
+        prefs.isGlobalPrivacyEnabled = false
+        val due = worker(true, input = input)
+        due.doWork()
+        assertTrue(due.disabled.isEmpty())
     }
 
-    @Test fun `relocking during a custom unlock delay preserves the outstanding restoration record`() {
+    @Test fun `relocking during a custom unlock delay preserves the outstanding restoration record`() = runBlocking {
         prefs.setFeatureEnableOnUnlock(PrivacyFeature.WIFI, true)
         prefs.setFeatureDelayOverride(PrivacyFeature.WIFI, false, 5)
         prefs.addFeaturesOffSinceUnlock(listOf(PrivacyFeature.WIFI))
         recordUnlock()
-        val unlock = worker(isLocking = false)
-        unlock.screenLocked = false
-        unlock.onFeatureWait = { recordLock(); unlock.screenLocked = true }
-        runBlocking { unlock.doWork() }
-        assertTrue(unlock.enabled.isEmpty())
+        worker(false).apply { screenLocked = false }.doWork()
+        val input = dueInput(false, PrivacyFeature.WIFI)
+        recordLock()
+        val due = worker(false, input = input).apply { screenLocked = true }
+        due.doWork()
+        assertTrue(due.enabled.isEmpty())
         assertTrue(PrivacyFeature.WIFI in prefs.featuresOffSinceUnlock)
     }
 
-    @Test fun `delayed sensors report each sensor that Android refuses to block`() {
+    @Test fun `delayed sensors report each sensor that Android refuses to block`() = runBlocking {
         prefs.setFeatureDisableOnLock(PrivacyFeature.CAMERA, true)
         prefs.setFeatureDisableOnLock(PrivacyFeature.MICROPHONE, true)
         prefs.setFeatureDelayOverride(PrivacyFeature.CAMERA, true, 2)
         prefs.setFeatureDelayOverride(PrivacyFeature.MICROPHONE, true, 5)
         recordLock()
-        val lock = worker(isLocking = true)
-        lock.deviceSecurelyLocked = true
-        lock.states[PrivacyFeature.CAMERA] = FeatureState.ENABLED
-        lock.states[PrivacyFeature.MICROPHONE] = FeatureState.ENABLED
-        runBlocking { lock.doWork() }
-        assertTrue(lock.disabled.isEmpty())
+        worker(true).doWork()
+        for (feature in listOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE)) {
+            val due = worker(true, input = dueInput(true, feature)).apply { deviceSecurelyLocked = true; states[feature] = FeatureState.ENABLED }
+            due.doWork()
+            assertTrue(due.disabled.isEmpty())
+        }
         assertEquals(setOf(PrivacyFeature.CAMERA, PrivacyFeature.MICROPHONE), prefs.sensorsLeftOnAtLastLock)
     }
 
-    @Test fun `in use checks are evaluated when the custom deadline arrives`() {
+    @Test fun `in use checks are evaluated when the custom deadline arrives`() = runBlocking {
         prefs.setFeatureDisableOnLock(PrivacyFeature.BLUETOOTH, true)
         prefs.setFeatureOnlyIfUnused(PrivacyFeature.BLUETOOTH, true)
         prefs.setFeatureDelayOverride(PrivacyFeature.BLUETOOTH, true, 5)
         recordLock()
-        val lock = worker(isLocking = true)
-        lock.onFeatureWait = { lock.featureInUse = true }
-        runBlocking { lock.doWork() }
-        assertTrue(lock.disabled.isEmpty())
+        worker(true).doWork()
+        val due = worker(true, input = dueInput(true, PrivacyFeature.BLUETOOTH)).apply { featureInUse = true }
+        due.doWork()
+        assertTrue(due.disabled.isEmpty())
     }
 
     @Test fun `reblocking a due feature never brings a later feature forward`() {
@@ -1888,7 +1913,6 @@ class PrivacyActionWorkerDoWorkTest {
         val reblock = worker(isLocking = true, isDeviceLocked = true, trigger = PrivacyActionWork.TRIGGER_REBLOCK)
         runBlocking { reblock.doWork() }
         assertEquals(listOf(PrivacyFeature.WIFI), reblock.disabled)
-        assertTrue(reblock.waits.isEmpty())
     }
 
     @Test fun `paused protection with custom timing does not wait for unneeded unlock actions`() {
@@ -1899,7 +1923,6 @@ class PrivacyActionWorkerDoWorkTest {
         val unlock = worker(isLocking = false)
         unlock.screenLocked = false
         runBlocking { unlock.doWork() }
-        assertTrue(unlock.waits.isEmpty())
         assertTrue(unlock.enabled.isEmpty())
     }
     @Test fun `thirty minute global timer is persisted without keeping worker alive`() = runBlocking {
@@ -1909,7 +1932,6 @@ class PrivacyActionWorkerDoWorkTest {
         val lock = worker(true)
         assertEquals(ListenableWorker.Result.success(), lock.doWork())
         assertEquals(listOf(Triple(setOf(PrivacyFeature.WIFI), true, 1800000L)), lock.deferred)
-        assertTrue(lock.waits.isEmpty())
         assertTrue(lock.disabled.isEmpty())
     }
 
@@ -1923,9 +1945,8 @@ class PrivacyActionWorkerDoWorkTest {
         val lock = worker(true)
         lock.onDefer = { assertTrue(lock.disabled.contains(PrivacyFeature.CAMERA)) }
         lock.doWork()
-        assertEquals(listOf(2000L), lock.waits)
-        assertEquals(listOf(PrivacyFeature.CAMERA to 0L, PrivacyFeature.WIFI to 2000L), lock.timedActions)
-        assertEquals(listOf(Triple(setOf(PrivacyFeature.BATTERY_SAVER), true, 1800000L)), lock.deferred)
+        assertEquals(listOf(PrivacyFeature.CAMERA to 0L), lock.timedActions)
+        assertEquals(listOf(Triple(setOf(PrivacyFeature.WIFI), true, 2000L), Triple(setOf(PrivacyFeature.BATTERY_SAVER), true, 1800000L)), lock.deferred)
     }
 
     @Test fun `thirty minute unlock uses its own persistent deadline`() = runBlocking {
@@ -1936,7 +1957,6 @@ class PrivacyActionWorkerDoWorkTest {
         val unlock = worker(false).apply { screenLocked = false }
         unlock.doWork()
         assertEquals(listOf(Triple(setOf(PrivacyFeature.WIFI), false, 1800000L)), unlock.deferred)
-        assertTrue(unlock.waits.isEmpty())
         assertTrue(unlock.enabled.isEmpty())
     }
 
@@ -1995,7 +2015,6 @@ class PrivacyActionWorkerDoWorkTest {
         val due = worker(true, input = input)
         due.doWork()
         assertEquals(listOf(PrivacyFeature.WIFI), due.disabled)
-        assertTrue(due.waits.isEmpty())
         assertTrue(due.deferred.isEmpty())
         assertTrue(PrivacyFeature.WIFI in prefs.featuresOffSinceUnlock)
         assertFalse(PrivacyFeature.BLUETOOTH in prefs.featuresOffSinceUnlock)
@@ -2028,9 +2047,13 @@ class PrivacyActionWorkerDoWorkTest {
         prefs.setFeatureDelayOverride(PrivacyFeature.LOCATION,true,5)
         recordLock()
         val lock=worker(true)
-        lock.onFeatureWait={lock.mapsKept=setOf(PrivacyFeature.LOCATION)}
-        lock.doWork();assertTrue(lock.disabled.isEmpty())
-        assertEquals(listOf(5000L),lock.waits)
+        lock.doWork()
+        assertEquals(listOf(Triple(setOf(PrivacyFeature.LOCATION), true, 5000L)), lock.deferred)
+        val due = worker(true, input = dueInput(true, PrivacyFeature.LOCATION)).apply {
+            mapsKept = setOf(PrivacyFeature.LOCATION)
+        }
+        due.doWork()
+        assertTrue(due.disabled.isEmpty())
     }
     @Test fun `keep off corrections cannot interrupt Maps`() = runBlocking {
         prefs.setFeatureDisableOnLock(PrivacyFeature.LOCATION,true)

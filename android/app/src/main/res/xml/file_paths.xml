@@ -3,4 +3,5 @@
     <files-path
         name="logs"
         path="." />
+    <cache-path name="updates" path="updates/" />
 </paths>

@@ -460,4 +460,14 @@ class SettingsKeyFallbackTest {
         assertTrue(d.dataOn)
         assertEquals("telephony re-reads mobile_data later, so it must not be left at 0", "1", d.global["mobile_data"])
     }
+    @Test
+    @Config(sdk = [34])
+    fun `battery saver with unreadable state is never reported as enabled`() = runBlocking {
+        val toggle = object : BatterySaverToggle(root) {
+            override suspend fun runCommands(commands: List<String>) = CommandResult.success()
+            override suspend fun runFeatureAction(enable: Boolean): CommandResult? = null
+            override suspend fun readFeatureState(): FeatureState? = null
+        }
+        assertFalse(toggle.enable().success)
+    }
 }

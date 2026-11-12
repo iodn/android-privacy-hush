@@ -36,7 +36,6 @@ object Constants {
         const val KEY_UNLOCK_DELAY = "unlock_delay_seconds"
         const val KEY_SHOW_COUNTDOWN = "show_countdown"
 
-        const val KEY_BACKGROUND_SERVICE_ENABLED = "background_service_enabled"
         const val KEY_DEBUG_NOTIFICATIONS_ENABLED = "debug_notifications_enabled"
         const val KEY_DEBUG_LOGS_ENABLED = "debug_logs_enabled"
 
@@ -67,7 +66,6 @@ object Constants {
         const val UNLOCK_DELAY_SECONDS = 1
         const val SHOW_COUNTDOWN = true
 
-        const val BACKGROUND_SERVICE_ENABLED = true
         const val DEBUG_NOTIFICATIONS_ENABLED = false
         const val DEBUG_LOGS_ENABLED = false
 
@@ -124,9 +122,5 @@ object Constants {
         // When true, won't disable on unlock if user manually enabled the mode
         const val AIRPLANE_MODE_ONLY_IF_NOT_MANUAL = true
         const val BATTERY_SAVER_ONLY_IF_NOT_MANUAL = true
-    }
-
-    object UI {
-        const val DONATE_URL = "https://www.paypal.me/duoveselia"
     }
 }

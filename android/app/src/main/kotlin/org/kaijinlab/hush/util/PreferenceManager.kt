@@ -3,7 +3,6 @@ package org.kaijinlab.hush.util
 import android.content.Context
 import android.content.SharedPreferences
 import org.kaijinlab.hush.data.PrivacyFeature
-import org.kaijinlab.hush.data.TimerSettings
 
 class PreferenceManager private constructor(private val context: Context) {
     
@@ -31,9 +30,6 @@ class PreferenceManager private constructor(private val context: Context) {
         get() = prefs.getBoolean(Constants.Preferences.KEY_SHOW_COUNTDOWN, Constants.Defaults.SHOW_COUNTDOWN)
         set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_SHOW_COUNTDOWN, value).apply()
 
-    var backgroundServiceEnabled: Boolean
-        get() = prefs.getBoolean(Constants.Preferences.KEY_BACKGROUND_SERVICE_ENABLED, Constants.Defaults.BACKGROUND_SERVICE_ENABLED)
-        set(value) = prefs.edit().putBoolean(Constants.Preferences.KEY_BACKGROUND_SERVICE_ENABLED, value).apply()
 
     var debugNotificationsEnabled: Boolean
         get() = prefs.getBoolean(Constants.Preferences.KEY_DEBUG_NOTIFICATIONS_ENABLED, Constants.Defaults.DEBUG_NOTIFICATIONS_ENABLED)
@@ -264,23 +260,6 @@ class PreferenceManager private constructor(private val context: Context) {
         prefs.edit().putString(key, features.joinToString(",") { it.name }).apply()
     }
 
-    fun updateTimerSettings(settings: TimerSettings) {
-        prefs.edit().apply {
-            putInt(Constants.Preferences.KEY_LOCK_DELAY, settings.lockDelaySeconds)
-            putInt(Constants.Preferences.KEY_UNLOCK_DELAY, settings.unlockDelaySeconds)
-            putBoolean(Constants.Preferences.KEY_SHOW_COUNTDOWN, settings.showCountdown)
-            apply()
-        }
-    }
-
-    fun updateScreenLockConfig(feature: PrivacyFeature, disableOnLock: Boolean, enableOnUnlock: Boolean) {
-        prefs.edit().apply {
-            putBoolean(Constants.Preferences.getFeatureLockKey(feature.name), disableOnLock)
-            putBoolean(Constants.Preferences.getFeatureUnlockKey(feature.name), enableOnUnlock)
-            apply()
-        }
-    }
-
     fun getRawPreferences(): SharedPreferences = prefs
 
     // ========== App Exemption Methods ==========
@@ -309,27 +288,4 @@ class PreferenceManager private constructor(private val context: Context) {
         val exemptAppsString = packageNames.joinToString(",")
         prefs.edit().putString(Constants.Preferences.KEY_EXEMPT_APPS, exemptAppsString).apply()
     }
-
-    /**
-     * Add an app to the exemption list.
-     *
-     * @param packageName Package name to add
-     */
-    fun addExemptApp(packageName: String) {
-        val currentExempt = getExemptApps().toMutableSet()
-        currentExempt.add(packageName)
-        setExemptApps(currentExempt)
-    }
-
-    /**
-     * Remove an app from the exemption list.
-     *
-     * @param packageName Package name to remove
-     */
-    fun removeExemptApp(packageName: String) {
-        val currentExempt = getExemptApps().toMutableSet()
-        currentExempt.remove(packageName)
-        setExemptApps(currentExempt)
-    }
-
 }

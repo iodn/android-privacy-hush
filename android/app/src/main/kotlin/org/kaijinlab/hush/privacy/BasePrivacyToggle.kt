@@ -39,7 +39,7 @@ abstract class BasePrivacyToggle(
         intended: FeatureState
     ): PrivacyResult {
         return try {
-            Log.d(TAG, "📍 ${action.replaceFirstChar { it.uppercase() }} $featureName - attempting ${commands.size} command(s)")
+            Log.d(TAG, "${action.replaceFirstChar { it.uppercase() }} $featureName - attempting ${commands.size} command(s)")
             commands.forEachIndexed { index, cmd ->
                 Log.d(TAG, "  Command ${index + 1}: ${cmd.primary}")
             }
@@ -47,12 +47,12 @@ abstract class BasePrivacyToggle(
             val viaApi = runFeatureAction(intended == FeatureState.ENABLED)
             val result = viaApi ?: runCommands(commands.map { it.primary })
 
-            Log.d(TAG, "📊 Command execution result: success=${result.success}, exitCode=${result.exitCode}")
+            Log.d(TAG, "Command execution result: success=${result.success}, exitCode=${result.exitCode}")
             if (result.output.isNotEmpty()) {
-                Log.d(TAG, "📊 Command output: ${result.output.joinToString("; ")}")
+                Log.d(TAG, "Command output: ${result.output.joinToString("; ")}")
             }
             if (result.error != null) {
-                Log.w(TAG, "⚠️ Command error: ${result.error}")
+                Log.w(TAG, "Command error: ${result.error}")
             }
 
             // Every command that could have run, not one guessed winner: executeWithFallbacks does
@@ -101,7 +101,7 @@ abstract class BasePrivacyToggle(
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "❌ EXCEPTION ${action}ing $featureName", e)
+            Log.e(TAG, "EXCEPTION ${action}ing $featureName", e)
             PrivacyResult(
                 feature = feature,
                 success = false,
@@ -131,7 +131,7 @@ abstract class BasePrivacyToggle(
                 // A service still switching reads as unknown, so only the last read gives up.
                 FeatureState.UNKNOWN, FeatureState.ERROR -> {
                     if (attempt == readBackAttempts - 1) {
-                        Log.w(TAG, "⚠️ $featureName reads as $actual - cannot confirm, reporting unconfirmed")
+                        Log.w(TAG, "$featureName reads as $actual - cannot confirm, reporting unconfirmed")
                         return Confirmation.UNREADABLE
                     }
                     delay(READ_BACK_GAP_MS)
@@ -139,7 +139,7 @@ abstract class BasePrivacyToggle(
                 else -> if (attempt < readBackAttempts - 1) delay(READ_BACK_GAP_MS)
             }
         }
-        Log.w(TAG, "⚠️ $featureName never reached $intended - command was accepted but ignored")
+        Log.w(TAG, "$featureName never reached $intended - command was accepted but ignored")
         return Confirmation.CONTRADICTED
     }
 

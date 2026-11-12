@@ -155,7 +155,16 @@ class ReblockWatcher(
             addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
         }
         try {
-            context.registerReceiver(receiver, filter)
+            // PROVIDERS_CHANGED is not platform-protected, so with targetSdk 33+ this mixed
+            // filter must declare itself non-exported on Android 13+, which also closes out
+            // third-party fakes of the provider-change nudge. If the platform rejects the
+            // flag because the filter is system-broadcasts-only here, registering without it
+            // is then exactly what that exemption allows.
+            try {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } catch (e: RuntimeException) {
+                context.registerReceiver(receiver, filter)
+            }
             context.contentResolver.registerContentObserver(Settings.Global.CONTENT_URI, true, observer)
             registered = true
             Log.i(TAG, "Block is on - watching for features changed back while locked")
@@ -219,9 +228,15 @@ class ReblockWatcher(
     }
 
     // An unreadable queue counts as waiting: a missed reblock is safer than one queued after stop().
+    // Asks for the same name PrivacyActionWork.enqueue chose through the same shared condition;
+    // a copy of the condition here could drift and look under NAME_LOCK for a job enqueued under
+    // NAME_REBLOCK, see nothing, and queue a duplicate.
     private fun lockJobWaiting(): Boolean = try {
         WorkManager.getInstance(context).getWorkInfosForUniqueWork(
-            if (preferenceManager.hasCustomFeatureDelays(true)) Constants.Work.NAME_REBLOCK else Constants.Work.NAME_LOCK
+            if (PrivacyActionWork.usesSplitReblock(preferenceManager))
+                Constants.Work.NAME_REBLOCK
+            else
+                Constants.Work.NAME_LOCK
         ).get()
             .any { it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.BLOCKED }
     } catch (e: Exception) {

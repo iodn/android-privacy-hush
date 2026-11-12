@@ -35,16 +35,16 @@ class ScreenStateReceiver : BroadcastReceiver() {
                 // between this line and doWork() actually starting).
                 PendingLockWork.recordLock(context)
                 if (!isDeviceSecurelyLocked(context, TAG)) {
-                    logDebug(context, "✅ Screen OFF but device NOT locked yet - triggering privacy actions")
+                    logDebug(context, "Screen OFF but device NOT locked yet - triggering privacy actions")
                     triggerPrivacyAction(context, isLocking = true, isDeviceLocked = false, reason = "Screen Off (Unlocked)")
                 } else {
-                    logWarning(context, "⚠️ Screen OFF and device ALREADY locked - Android refuses camera/mic sensor privacy changes now")
+                    logWarning(context, "Screen OFF and device ALREADY locked - Android refuses camera/mic sensor privacy changes now")
                     triggerPrivacyAction(context, isLocking = true, isDeviceLocked = true, reason = "Screen Off (Locked)")
                 }
             }
 
             Intent.ACTION_USER_PRESENT -> {
-                logDebug(context, "🔓 Screen UNLOCKED (user authenticated) - triggering privacy actions")
+                logDebug(context, "Screen UNLOCKED (user authenticated) - triggering privacy actions")
                 // Record the unlock unconditionally, before anything else - even when the cancel
                 // below is skipped, so a lock cycle that could not safely be cancelled at this
                 // moment still finds out about this unlock at its own later checkpoint. A plain
@@ -82,9 +82,9 @@ class ScreenStateReceiver : BroadcastReceiver() {
                 val isStillLocked = keyguardManager?.isKeyguardLocked ?: true
 
                 if (isStillLocked) {
-                    logDebug(context, "💡 Screen turned ON but still locked - keeping pending lock work")
+                    logDebug(context, "Screen turned ON but still locked - keeping pending lock work")
                 } else {
-                    logDebug(context, "💡 Screen turned ON and not locked - cancelling pending lock work")
+                    logDebug(context, "Screen turned ON and not locked - cancelling pending lock work")
                     // Recorded unconditionally, same reason as ACTION_USER_PRESENT above - this
                     // branch only reaches here once isStillLocked is already confirmed false, so
                     // it is always a genuine unlock signal.
@@ -108,7 +108,7 @@ class ScreenStateReceiver : BroadcastReceiver() {
             }
 
             else -> {
-                logWarning(context, "⚠️ Unexpected intent action: ${intent.action}")
+                logWarning(context, "Unexpected intent action: ${intent.action}")
             }
         }
     }
@@ -121,14 +121,14 @@ class ScreenStateReceiver : BroadcastReceiver() {
         // (enqueued with isDeviceLocked=false at the time) carries its own delay through to the
         // same regular-features step.
         if (isLocking && PrivacyActionWorker.sensorDisableInProgress) {
-            logDebug(context, "⏳ Sensor disable already in progress - not replacing it (reason: $reason)")
+            logDebug(context, "Sensor disable already in progress - not replacing it (reason: $reason)")
             return
         }
         // The enable-side twin of the guard above: without it, a 3rd unlock signal
         // REPLACE-enqueuing while a 2nd is still mid-way through enabling camera/mic would
         // cancel that in-flight coroutine outright, leaving sensors off after a real unlock.
         if (!isLocking && PrivacyActionWorker.sensorEnableInProgress) {
-            logDebug(context, "⏳ Sensor enable already in progress - not replacing it (reason: $reason)")
+            logDebug(context, "Sensor enable already in progress - not replacing it (reason: $reason)")
             return
         }
         try {
@@ -152,6 +152,5 @@ class ScreenStateReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "hush-ScreenStateReceiver"
         private val WORK_NAME_LOCK = org.kaijinlab.hush.util.Constants.Work.NAME_LOCK
-        private val WORK_NAME_UNLOCK = org.kaijinlab.hush.util.Constants.Work.NAME_UNLOCK
     }
 }

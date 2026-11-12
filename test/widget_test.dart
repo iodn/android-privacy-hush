@@ -15,6 +15,7 @@ Map<String, Object?> fixture({bool granted = true, String theme = 'system'}) =>
       'method': 'Shizuku',
       'running': true,
       'battery': true,
+      'exactAlarms': true,
       'notifications': true,
       'bluetoothPermission': true,
       'usageAccess': true,
@@ -52,6 +53,7 @@ Map<String, Object?> fixture({bool granted = true, String theme = 'system'}) =>
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('org.kaijinlab.hush/control');
+  const updates = MethodChannel('org.kaijinlab.hush/updates');
   late Map<String, Object?> stored;
   late List<MethodCall> calls;
   late HushController controller;
@@ -72,6 +74,16 @@ void main() {
   });
 
   setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          updates,
+          (call) async => {
+            'installed': '1.5.0',
+            'automatic': false,
+            'available': false,
+            'phase': 'idle',
+          },
+        );
     stored = fixture();
     calls = [];
     controller = HushController(channel: channel);
@@ -107,6 +119,8 @@ void main() {
 
   tearDown(() {
     controller.dispose();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(updates, null);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
   });

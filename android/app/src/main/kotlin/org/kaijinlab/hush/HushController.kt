@@ -8,6 +8,7 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
 import org.kaijinlab.hush.data.*
+import org.kaijinlab.hush.privilege.PrivilegeMethod
 import org.kaijinlab.hush.privacy.PrivacyManager
 import org.kaijinlab.hush.root.RootManager
 import org.kaijinlab.hush.service.PrivacyMonitorService
@@ -23,6 +24,12 @@ class HushController(private val activity: android.app.Activity) {
     private val root = RootManager.getInstance(Unit)
     private val logger = DebugLogHelper.getInstance(context)
     private var states: Map<PrivacyFeature, FeatureState> = emptyMap()
+
+    private companion object {
+        // The backends that can read Google Maps' own usage for the exception rule; shared by
+        // the snapshot flag and the setter's require so the two cannot drift apart.
+        val MAPS_PRIVILEGE_METHODS = setOf(PrivilegeMethod.ROOT, PrivilegeMethod.SHIZUKU, PrivilegeMethod.SUI)
+    }
 
     suspend fun handle(method: String, arguments: Any?): Any? {
         val args = (arguments as? Map<*, *>) ?: emptyMap<Any, Any>()
@@ -74,13 +81,15 @@ class HushController(private val activity: android.app.Activity) {
         } else states = emptyMap()
         return mapOf(
             "enabled" to prefs.isGlobalPrivacyEnabled,
-            "mapsSupported" to (root.getPrivilegeMethod() in setOf(org.kaijinlab.hush.privilege.PrivilegeMethod.ROOT, org.kaijinlab.hush.privilege.PrivilegeMethod.SHIZUKU, org.kaijinlab.hush.privilege.PrivilegeMethod.SUI)),
+            "mapsSupported" to (root.getPrivilegeMethod() in MAPS_PRIVILEGE_METHODS),
             "mapsUnverified" to prefs.getRawPreferences().getBoolean(org.kaijinlab.hush.util.MapsConnectivityGuard.WARNING_KEY, false),
             "granted" to granted,
             "available" to root.isRootAvailable(),
             "method" to root.getPrivilegeMethod().getDisplayName(),
             "running" to PrivacyMonitorService.isRunning(),
             "battery" to BatteryOptimizationManager(context).isIgnoringBatteryOptimizations(),
+            "exactAlarms" to DeferredActionWork.canScheduleExactAlarms(context),
+            "oemAutostart" to OemAutostartHelper.hasKnownPage,
             "charging" to ((context.registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
                 ?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0),
             "notifications" to NotificationManagerCompat.from(context).areNotificationsEnabled(),
@@ -156,7 +165,7 @@ class HushController(private val activity: android.app.Activity) {
                 }
                 "unused" -> prefs.setFeatureOnlyIfUnused(feature, enabled)
                 "maps" -> {
-                    require(!enabled || root.getPrivilegeMethod() in setOf(org.kaijinlab.hush.privilege.PrivilegeMethod.ROOT, org.kaijinlab.hush.privilege.PrivilegeMethod.SHIZUKU, org.kaijinlab.hush.privilege.PrivilegeMethod.SUI)) { "Google Maps exception requires Root or Shizuku" }
+                    require(!enabled || root.getPrivilegeMethod() in MAPS_PRIVILEGE_METHODS) { "Google Maps exception requires Root or Shizuku" }
                     prefs.setFeatureKeepForMaps(feature, enabled)
                 }
                 "notEnabled" -> prefs.setFeatureOnlyIfNotEnabled(feature, enabled)
@@ -210,6 +219,10 @@ class HushController(private val activity: android.app.Activity) {
             } else launch(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
             "bluetooth" -> if (Build.VERSION.SDK_INT >= 31) activity.requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 21)
             "battery" -> launch(BatteryOptimizationManager(context).createBatteryOptimizationIntent() ?: Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            "exactAlarms" -> if (Build.VERSION.SDK_INT >= 31) launch(
+                Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}"))
+            )
+            "autostart" -> OemAutostartHelper.openSettings(context)
             "usage" -> launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, Uri.parse("package:${context.packageName}")))
             "accessibility" -> launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             "security" -> launch(Intent(Settings.ACTION_SECURITY_SETTINGS))

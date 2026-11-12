@@ -19,11 +19,11 @@ object ScreenStateReceiverManager {
             }
             
             context.registerReceiver(receiver, filter)
-            Log.i(tag, "✅ Screen state receiver registered successfully")
+            Log.i(tag, "Screen state receiver registered successfully")
             
             receiver
         } catch (e: Exception) {
-            Log.e(tag, "❌ Failed to register screen state receiver", e)
+            Log.e(tag, "Failed to register screen state receiver", e)
             null
         }
     }
@@ -32,10 +32,10 @@ object ScreenStateReceiverManager {
         try {
             receiver?.let {
                 context.unregisterReceiver(it)
-                Log.i(tag, "✅ Screen state receiver unregistered successfully")
+                Log.i(tag, "Screen state receiver unregistered successfully")
             }
         } catch (e: Exception) {
-            Log.e(tag, "❌ Failed to unregister screen state receiver", e)
+            Log.e(tag, "Failed to unregister screen state receiver", e)
         }
     }
 }

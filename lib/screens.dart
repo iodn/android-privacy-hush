@@ -1,3 +1,4 @@
+import 'update_settings.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'hush.dart';
@@ -138,6 +139,16 @@ class HomeScreen extends StatelessWidget {
       const SizedBox(width: 8),
     ],
     content: (context, state) => [
+      ListenableBuilder(
+        listenable: controller.updates,
+        builder: (context, _) => controller.updates.available
+            ? linkRow(
+                'Update available',
+                () => push(context, SettingsScreen(controller: controller)),
+                value: controller.updates.text('version'),
+              )
+            : const SizedBox.shrink(),
+      ),
       SwitchListTile.adaptive(
         title: const Text(
           'Protection',
@@ -159,7 +170,9 @@ class HomeScreen extends StatelessWidget {
           () => push(context, PermissionsScreen(controller: controller)),
         ),
       if (state.flag('granted') &&
-          (!state.flag('battery') || !state.flag('notifications')))
+          (!state.flag('battery') ||
+              !state.flag('notifications') ||
+              !state.flag('exactAlarms')))
         linkRow(
           'Finish setup',
           () => push(context, PermissionsScreen(controller: controller)),
@@ -386,6 +399,8 @@ class SettingsScreen extends StatelessWidget {
         () => push(context, AdvancedScreen(controller: controller)),
       ),
       linkRow('Logs', () => push(context, LogsScreen(controller: controller))),
+      const Divider(indent: 24, endIndent: 24),
+      UpdateSettings(controller: controller.updates),
     ],
   );
 
@@ -632,6 +647,23 @@ class PermissionsScreen extends StatelessWidget {
       if (!state.flag('granted'))
         linkRow('Check again', () => controller.refresh()),
       _permission('Background battery use', state.flag('battery'), 'battery'),
+      _permission('Accurate timers', state.flag('exactAlarms'), 'exactAlarms'),
+      if (!state.flag('exactAlarms'))
+        note(
+          context,
+          'Allow alarms so delayed actions can run with the screen off. Otherwise timers may run late.',
+        ),
+      note(
+        context,
+        'Never force-stop Hush: the system cannot restart a force-stopped '
+        'app until you open it again.',
+      ),
+      if (state.flag('oemAutostart'))
+        linkRow(
+          'Manufacturer battery settings',
+          () => controller.open('autostart'),
+          subtitle: 'Allow Hush to start automatically',
+        ),
       _permission(
         'Notifications',
         state.flag('notifications'),

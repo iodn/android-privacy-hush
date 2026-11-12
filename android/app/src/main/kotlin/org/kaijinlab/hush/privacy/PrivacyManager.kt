@@ -22,7 +22,7 @@ class PrivacyManager private constructor(
         private const val TAG = "hush-PrivacyManager"
 
         internal fun attemptedLine(commandUsed: String?): String =
-            "❌ Commands attempted: ${commandUsed ?: "none recorded"}"
+            "Commands attempted: ${commandUsed ?: "none recorded"}"
     }
 
     private val mapsGuard by lazy { org.kaijinlab.hush.util.MapsConnectivityGuard(context) }
@@ -82,10 +82,10 @@ class PrivacyManager private constructor(
         val action = if (enable) "enable" else "disable"
         val results = mutableListOf<PrivacyResult>()
 
-        logDebug("📍 executeFeatureAction START: action=$action, features=${features.map { it.displayName }}")
+        logDebug("executeFeatureAction START: action=$action, features=${features.map { it.displayName }}")
 
         features.forEach { feature ->
-            logDebug("🔄 Attempting to $action ${feature.displayName}...")
+            logDebug("Attempting to $action ${feature.displayName}...")
 
             val toggle = toggles[feature]
             if (toggle != null) {
@@ -101,16 +101,16 @@ class PrivacyManager private constructor(
                     if (wasOn && result.success) org.kaijinlab.hush.util.MapsConnectivityGuard.recordDisabled(context, feature, generation)
                     results.add(result)
 
-                    val status = if (result.success) "✅ SUCCESS" else "❌ FAILED"
+                    val status = if (result.success) "SUCCESS" else "FAILED"
                     logDebug("$status $action ${feature.displayName}: ${result.message}")
                     if (!result.success) {
                         logWarning(attemptedLine(result.commandUsed))
-                        logWarning("❌ Error details: ${result.message}")
+                        logWarning("Error details: ${result.message}")
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    logError("❌ EXCEPTION ${action}ing $feature", e)
+                    logError("EXCEPTION ${action}ing $feature", e)
                     results.add(
                         PrivacyResult(
                             feature = feature,
@@ -120,7 +120,7 @@ class PrivacyManager private constructor(
                     )
                 }
             } else {
-                logError("❌ Toggle not found for $feature")
+                logError("Toggle not found for $feature")
                 results.add(
                     PrivacyResult(
                         feature = feature,
@@ -133,21 +133,9 @@ class PrivacyManager private constructor(
 
         val successCount = results.count { it.success }
         val failCount = results.count { !it.success }
-        logDebug("📍 executeFeatureAction END: $successCount succeeded, $failCount failed")
+        logDebug("executeFeatureAction END: $successCount succeeded, $failCount failed")
 
         return@withContext results
-    }
-    
-
-    
-    suspend fun getPrivacyStatus(): PrivacyStatus = withContext(Dispatchers.IO) {
-        val currentStatus = getCurrentStatus()
-        val activeFeatures = currentStatus.filterValues { it == FeatureState.DISABLED }.keys
-        
-        PrivacyStatus(
-            isActive = activeFeatures.isNotEmpty(),
-            activeFeatures = activeFeatures
-        )
     }
 }
 

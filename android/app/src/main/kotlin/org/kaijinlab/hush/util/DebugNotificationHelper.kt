@@ -126,28 +126,28 @@ class DebugNotificationHelper private constructor(private val context: Context) 
     fun notifyPrivacyAction(isLockCycle: Boolean, didEnable: Boolean, features: List<String>) {
         if (features.isEmpty()) return
         notify(
-            if (isLockCycle) "🔒 Screen Locked" else "🔓 Screen Unlocked",
+            if (isLockCycle) "Screen Locked" else "Screen Unlocked",
             "${if (didEnable) "Enabling" else "Disabling"}: ${features.joinToString(", ")}"
         )
     }
 
     fun notifyFeatureSkipped(feature: String, reason: String) {
         notify(
-            "⏸️ Feature Skipped",
+            "Feature Skipped",
             "$feature - $reason"
         )
     }
 
     fun notifyActionCancelled(reason: String) {
         notify(
-            "⚠️ Action Cancelled",
+            "Action Cancelled",
             reason
         )
     }
 
     fun notifyError(message: String) {
         notify(
-            "❌ Action Failed",
+            "Action Failed",
             message,
             autoDismiss = false
         )
@@ -155,14 +155,14 @@ class DebugNotificationHelper private constructor(private val context: Context) 
 
     fun notifyGlobalPrivacyDisabled() {
         notify(
-            "🚫 Privacy Protection OFF",
+            "Privacy Protection OFF",
             "Actions skipped - Global privacy is disabled"
         )
     }
 
     fun notifyNoPrivilege() {
         notify(
-            "❌ No Permission",
+            "No Permission",
             "Cannot execute actions - Root/Shizuku permission not granted",
             autoDismiss = false
         )

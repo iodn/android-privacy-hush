@@ -10,7 +10,7 @@ class FailedSwitchLogLineTest {
     @Test
     fun `a switch made by shell commands names the commands`() {
         assertEquals(
-            "❌ Commands attempted: svc nfc disable",
+            "Commands attempted: svc nfc disable",
             PrivacyManager.attemptedLine("svc nfc disable")
         )
     }
@@ -21,6 +21,6 @@ class FailedSwitchLogLineTest {
         val line = PrivacyManager.attemptedLine(null)
 
         assertFalse(line, line.contains("null"))
-        assertEquals("❌ Commands attempted: none recorded", line)
+        assertEquals("Commands attempted: none recorded", line)
     }
 }

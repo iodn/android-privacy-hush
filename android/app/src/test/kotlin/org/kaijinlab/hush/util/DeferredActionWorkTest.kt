@@ -46,6 +46,7 @@ class DeferredActionWorkTest {
     @Test fun `duplicate recovery preserves queued job and unlock cancels persistent lock timers`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         org.kaijinlab.hush.initWorkManagerWithoutRealWork(context)
+        org.robolectric.shadows.ShadowAlarmManager.setCanScheduleExactAlarms(false)
         val manager = androidx.work.WorkManager.getInstance(context)
         DeferredActionWork.recordState(context, true)
         val generation = DeferredActionWork.generation(context)

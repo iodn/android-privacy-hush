@@ -39,12 +39,12 @@ open class NFCToggle(
     // From Android 15 svc nfc can exit 0 without switching, and the NFC service's own commands are
     // disable-nfc/enable-nfc. '[persist]' keeps it off after a reboot, as svc nfc disable did.
     private fun commandsFor(on: Boolean): List<CommandSet> {
-        val svc = CommandSet("svc nfc ${if (on) "enable" else "disable"}", description = "Service control method")
+        val svc = CommandSet("svc nfc ${if (on) "enable" else "disable"}")
         if (Build.VERSION.SDK_INT < 35) {
-            return listOf(svc, CommandSet("cmd nfc ${if (on) "enable" else "disable"}", description = "Modern cmd method (Android 8+)"))
+            return listOf(svc, CommandSet("cmd nfc ${if (on) "enable" else "disable"}"))
         }
         return listOf(
-            CommandSet(if (on) "cmd nfc enable-nfc" else "cmd nfc disable-nfc '[persist]'", description = "NFC service shell command"),
+            CommandSet(if (on) "cmd nfc enable-nfc" else "cmd nfc disable-nfc '[persist]'"),
             svc
         )
     }
@@ -52,11 +52,11 @@ open class NFCToggle(
     // No "nfc_on" global setting: the NFC service keeps that flag in its own preferences, so
     // writing it switches nothing and reading it back only echoes the write.
     override val statusCommands = listOf(
-        CommandSet("dumpsys nfc | grep 'mState='", description = "Primary status check")
+        CommandSet("dumpsys nfc | grep 'mState='")
     )
 
     override fun parseStatusOutput(output: String): FeatureState {
-        Log.d(TAG, "🔍 Parsing NFC status output: '$output'")
+        Log.d(TAG, "Parsing NFC status output: '$output'")
 
         val state = when {
             output.contains("mState=on", ignoreCase = true) -> FeatureState.ENABLED
@@ -68,7 +68,7 @@ open class NFCToggle(
             else -> FeatureState.UNKNOWN
         }
 
-        Log.d(TAG, "🔍 Parsed NFC state: $state")
+        Log.d(TAG, "Parsed NFC state: $state")
         return state
     }
 
@@ -80,7 +80,7 @@ open class NFCToggle(
      * it only asks whether NFC came back on, never why, so every device gets it.
      */
     override suspend fun disable(): PrivacyResult {
-        Log.d(TAG, "📍 Starting NFC disable sequence...")
+        Log.d(TAG, "Starting NFC disable sequence...")
 
         val initialResult = super.disable()
 
@@ -93,14 +93,14 @@ open class NFCToggle(
             // Only a fresh "off" read says NFC stayed off. Otherwise the base result stands: for an
             // unreadable state that is a success worded "could not be read back", never "stayed off".
             if (actualState == FeatureState.DISABLED) {
-                Log.d(TAG, "✅ NFC is off and stayed off")
+                Log.d(TAG, "NFC is off and stayed off")
                 return PrivacyResult(feature, true, "NFC disabled", commandUsed = initialResult.commandUsed)
             }
-            Log.w(TAG, "⚠️ NFC could not be confirmed off (state: $actualState)")
+            Log.w(TAG, "NFC could not be confirmed off (state: $actualState)")
             return initialResult
         }
 
-        Log.w(TAG, "⚠️ NFC reports enabled again right after being disabled")
+        Log.w(TAG, "NFC reports enabled again right after being disabled")
 
         val preferenceManager = PreferenceManager.getInstance(context)
         val autoRetryEnabled = preferenceManager.samsungNfcAutoRetry
@@ -117,7 +117,7 @@ open class NFCToggle(
             )
         }
 
-        Log.i(TAG, "🔄 Auto-retry enabled - attempting aggressive re-disable...")
+        Log.i(TAG, "Auto-retry enabled - attempting aggressive re-disable...")
 
         var retryCount = 0
         val maxRetries = 3 // Hard limit to prevent infinite loop
@@ -126,7 +126,7 @@ open class NFCToggle(
 
         while (retryCount < maxRetries) {
             retryCount++
-            Log.d(TAG, "🔄 Retry attempt $retryCount of $maxRetries")
+            Log.d(TAG, "Retry attempt $retryCount of $maxRetries")
 
             lastAttempt = super.disable()
 
@@ -134,7 +134,7 @@ open class NFCToggle(
 
             val newState = getCurrentState()
             if (newState == FeatureState.DISABLED) {
-                Log.i(TAG, "✅ Auto-retry successful on attempt $retryCount - NFC disabled")
+                Log.i(TAG, "Auto-retry successful on attempt $retryCount - NFC disabled")
                 return PrivacyResult(
                     feature = feature,
                     success = true,
@@ -143,12 +143,12 @@ open class NFCToggle(
                 )
             }
 
-            Log.d(TAG, "❌ Retry attempt $retryCount did not read back as disabled (state: $newState)")
+            Log.d(TAG, "Retry attempt $retryCount did not read back as disabled (state: $newState)")
         }
 
         // Says what was observed, not why. A read can also come back UNKNOWN mid-transition, so
         // claiming "still enabled" here would sometimes be telling the user something untrue.
-        Log.w(TAG, "❌ Auto-retry exhausted all $maxRetries attempts - NFC never read back as disabled")
+        Log.w(TAG, "Auto-retry exhausted all $maxRetries attempts - NFC never read back as disabled")
         return PrivacyResult(
             feature = feature,
             success = false,

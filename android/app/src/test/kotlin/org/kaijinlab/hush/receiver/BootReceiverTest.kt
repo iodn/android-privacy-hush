@@ -8,7 +8,6 @@ import androidx.work.WorkManager
 import org.kaijinlab.hush.initWorkManagerWithoutRealWork
 import org.kaijinlab.hush.service.PrivacyMonitorService
 import org.kaijinlab.hush.util.DeferredActionWork
-import org.kaijinlab.hush.util.PreferenceManager
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -32,7 +31,6 @@ class BootReceiverTest {
         BootReceiver().onReceive(context, Intent(Intent.ACTION_BOOT_COMPLETED))
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(301))
         assertEquals(PrivacyMonitorService::class.java.name, shadowOf(context).nextStartedService.component!!.className)
-        assertTrue(PreferenceManager.getInstance(context).backgroundServiceEnabled)
         assertEquals(oldGeneration + 1, DeferredActionWork.generation(context))
         assertEquals(1, WorkManager.getInstance(context).getWorkInfosForUniqueWork("hush_service_health").get().size)
     }

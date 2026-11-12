@@ -23,11 +23,25 @@ object PrivacyActionWork {
     const val KEY_IS_DEVICE_LOCKED = "is_device_locked"
     const val KEY_TRIGGER = "trigger"
     const val KEY_REASON = "reason"
+    const val KEY_TRIGGERED_AT = "triggered_at"
     // Per feature, SystemClock.elapsedRealtime() when a reblock first saw it back on: "WIFI=123,NFC=456".
     const val KEY_FOUND_ON_AT = "found_on_at"
 
     const val TRIGGER_SERVICE_INIT = "service_init"
     const val TRIGGER_REBLOCK = "reblock"
+
+    // Delayed features have separate durable timers; reblocking must not bring them forward.
+    fun usesSplitReblock(prefs: PreferenceManager): Boolean =
+        prefs.hasCustomFeatureDelays(true) || prefs.lockDelaySeconds > 0
+
+    fun configuredFeatures(prefs: PreferenceManager, locking: Boolean): List<PrivacyFeature> =
+        PrivacyFeature.values().filter {
+            if (locking) prefs.getFeatureDisableOnLock(it) else prefs.getFeatureEnableOnUnlock(it)
+        }.filter {
+            locking || prefs.isGlobalPrivacyEnabled ||
+                if (it in PrivacyFeature.getSystemModeFeatures()) prefs.getFeatureEnabledByApp(it)
+                else it in prefs.featuresOffSinceUnlock
+        }
 
     /**
      * Lock work and unlock work each have one unique name, so a newer action of the same
@@ -42,7 +56,8 @@ object PrivacyActionWork {
         isDeviceLocked: Boolean,
         trigger: String,
         reason: String,
-        foundOnAt: Map<PrivacyFeature, Long> = emptyMap()
+        foundOnAt: Map<PrivacyFeature, Long> = emptyMap(),
+        triggeredAt: Long? = null
     ): OneTimeWorkRequest = OneTimeWorkRequestBuilder<PrivacyActionWorker>()
         .setInputData(
             workDataOf(
@@ -50,6 +65,7 @@ object PrivacyActionWork {
                 KEY_IS_DEVICE_LOCKED to isDeviceLocked,
                 KEY_TRIGGER to trigger,
                 KEY_REASON to reason,
+                KEY_TRIGGERED_AT to triggeredAt,
                 KEY_FOUND_ON_AT to foundOnAt.entries.joinToString(",") { "${it.key.name}=${it.value}" }
             )
         )
@@ -68,13 +84,22 @@ object PrivacyActionWork {
         foundOnAt: Map<PrivacyFeature, Long> = emptyMap()
     ): String {
         val prefs = PreferenceManager.getInstance(context)
-        val separateReblock = trigger == TRIGGER_REBLOCK &&
-            (prefs.hasCustomFeatureDelays(true) || prefs.lockDelaySeconds > 300)
+        val separateReblock = trigger == TRIGGER_REBLOCK && usesSplitReblock(prefs)
         val name = workName(isLocking, separateReblock)
+        // Arm the OS before returning from SCREEN_OFF. The initial worker itself may be
+        // dispatched late once the CPU sleeps, so it must not be the only place that arms timers.
+        if (trigger != TRIGGER_REBLOCK && (!isLocking || prefs.isGlobalPrivacyEnabled)) {
+            DeferredActionWork.generationForState(context, isLocking)?.let { generation ->
+                configuredFeatures(prefs, isLocking).groupBy { prefs.getFeatureDelaySeconds(it, isLocking) }
+                    .filterKeys { it > 0 }.forEach { (seconds, features) ->
+                        DeferredActionWork.enqueue(context, features.toSet(), isLocking, seconds * 1000L, generation)
+                    }
+            }
+        }
         WorkManager.getInstance(context).enqueueUniqueWork(
             name,
             policy,
-            buildRequest(isLocking, isDeviceLocked, trigger, reason, foundOnAt)
+            buildRequest(isLocking, isDeviceLocked, trigger, reason, foundOnAt, android.os.SystemClock.elapsedRealtime())
         )
         return name
     }

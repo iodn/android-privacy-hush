@@ -3,7 +3,11 @@ package org.kaijinlab.hush.util
 import org.kaijinlab.hush.data.FeatureState
 
 object StatusParsingUtils {
-    
+
+    // The same sensor ids (1 and 2) are parsed on every read-back attempt, so each pattern is
+    // compiled once and reused instead of rebuilt per call.
+    private val sensorPatterns = java.util.concurrent.ConcurrentHashMap<Int, Regex>()
+
     /**
      * Standard parsing logic for feature status output
      * Handles common patterns across different privacy features
@@ -82,7 +86,9 @@ object StatusParsingUtils {
     fun parseSensorPrivacyOutput(output: String, sensorId: Int): FeatureState {
         try {
             // Look for the sensor block in the output
-            val sensorPattern = "sensor=$sensorId[\\s\\S]*?state_type=(\\d+)".toRegex()
+            val sensorPattern = sensorPatterns.getOrPut(sensorId) {
+                "sensor=$sensorId[\\s\\S]*?state_type=(\\d+)".toRegex()
+            }
             val match = sensorPattern.find(output)
 
             return if (match != null) {

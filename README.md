@@ -18,7 +18,7 @@ Once protection is enabled, you can close the app. The Android service handles y
 
 Hush needs Android 8.0 or newer and access through Root, Sui, Shizuku, or Dhizuku. Some controls depend on your Android version and access method. Camera and microphone privacy controls need Android 12 or newer.
 
-Install the APK, open Hush, and go to **Settings > Permissions**. Grant access and complete the background setup shown there.
+Install the APK, open Hush, and go to **Settings > Permissions**. Grant access and complete the background setup shown there. Enable **Accurate timers** to allow delayed actions while the screen is off. Without alarm access, timers are best effort. Android can still throttle closely spaced alarms during deep idle.
 
 Tap a control on the home screen to configure it. Choose what happens when the phone locks, what happens when it unlocks, and how long to wait. **Use default** follows the timer in Settings. Turn on **Protection** when you are ready.
 
@@ -27,6 +27,12 @@ Tap a control on the home screen to configure it. Choose what happens when the p
 If you use Maps with the screen locked, open **Location Services** and enable **Keep on for Google Maps**. Enable the same option under **WiFi** and **Mobile Data** if you also want internet access to stay available.
 
 The exception covers navigation and viewing Maps. It keeps services that are already on available while Maps is in use, then returns to your lock rules after Maps stops, with a short grace period. It needs Root, Sui, or Shizuku.
+
+## App updates
+
+Open **Settings > App updates** to check GitHub, read release notes, and download the APK for your device. Android asks you to confirm installation. Your settings are preserved.
+
+Automatic checks run once a day when Hush opens and can be disabled. Downloads start only when requested. Hush verifies the release checksum, package, version and signing certificate before installation.
 
 ## Building
 
@@ -43,7 +49,11 @@ To build an APK:
 flutter build apk --release
 ```
 
+For separate ARM, ARM64 and x86_64 APKs, use `flutter build apk --release --split-per-abi`.
+
 The APK is written to `build/app/outputs/flutter-apk/app-release.apk`. Local release builds use development signing; configure your own release key before publishing.
+
+For a new release, increment both values in `version: name+code` in `pubspec.yaml` and keep the same signing key. Publish a stable GitHub release tagged `vVERSION` with `Hush-VERSION-arm.apk`, `Hush-VERSION-arm64.apk`, `Hush-VERSION-x86_64.apk` and `Hush-VERSION-universal.apk`. These correspond to Flutter’s `armeabi-v7a`, `arm64-v8a`, `x86_64` and combined APKs. GitHub supplies the checksums used by the updater.
 
 ## Checking changes
 

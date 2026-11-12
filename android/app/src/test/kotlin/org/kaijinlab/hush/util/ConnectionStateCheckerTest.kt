@@ -47,4 +47,11 @@ class ConnectionStateCheckerTest {
     fun `blank output is treated as not in use, never a guessed positive`() {
         assertEquals(false, ConnectionStateChecker.parseLocationInUseOutput(""))
     }
+    @Test fun `disconnected WiFi does not count as connected`() {
+        assertEquals(false, ConnectionStateChecker.parseWifiConnected("type: WIFI, state: DISCONNECTED/DISCONNECTED"))
+        assertEquals(true, ConnectionStateChecker.parseWifiConnected("type: WIFI, state: CONNECTED/CONNECTED"))
+        assertEquals(false, ConnectionStateChecker.parseWifiConnected("WIFI DISCONNECTED\nMOBILE CONNECTED"))
+        assertEquals(false, ConnectionStateChecker.parseWifiConnected("Transports: WIFI\nTransports: CELLULAR VALIDATED"))
+        assertEquals(true, ConnectionStateChecker.parseWifiConnected("Transports: WIFI Capabilities: INTERNET VALIDATED"))
+    }
 }

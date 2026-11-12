@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'updates.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -72,6 +73,7 @@ class HushController extends ChangeNotifier {
     : channel = channel ?? const MethodChannel('org.kaijinlab.hush/control');
 
   final MethodChannel channel;
+  final updates = AppUpdatesController();
   HushState? state;
   String initialTheme = 'system';
   bool busy = false;
@@ -175,6 +177,7 @@ class HushController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    updates.dispose();
     super.dispose();
   }
 }

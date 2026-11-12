@@ -31,9 +31,10 @@ object PendingLockWork {
         try {
             val operation = WorkManager.getInstance(context).cancelUniqueWork(workName)
             if (workName == Constants.Work.NAME_LOCK || workName == Constants.Work.NAME_UNLOCK) {
+                DeferredActionWork.cancelTimers(context, workName == Constants.Work.NAME_LOCK)
                 WorkManager.getInstance(context).cancelAllWorkByTag(DeferredActionWork.tag(workName == Constants.Work.NAME_LOCK))
             }
-            logInfo(context, tag, "🚫 Cancelling pending work ($workName) due to a confirmed opposite action")
+            logInfo(context, tag, "Cancelling pending work ($workName) due to a confirmed opposite action")
             // cancelUniqueWork()'s returned Operation would otherwise be discarded, silently
             // assuming success at the call site - PendingLockWorkTest's "cancel reads the real
             // Operation outcome..." test proves this listener genuinely reads the resolved
@@ -46,9 +47,9 @@ object PendingLockWork {
             operation.result.addListener({
                 try {
                     operation.result.get()
-                    logInfo(context, tag, "✅ Pending work ($workName) cancel confirmed by WorkManager")
+                    logInfo(context, tag, "Pending work ($workName) cancel confirmed by WorkManager")
                 } catch (e: Exception) {
-                    logError(context, tag, "❌ Pending work ($workName) cancel FAILED - a stale action may still fire later", e)
+                    logError(context, tag, "Pending work ($workName) cancel FAILED - a stale action may still fire later", e)
                 }
             }, Executor { it.run() })
         } catch (e: Exception) {

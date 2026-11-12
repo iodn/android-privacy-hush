@@ -19,41 +19,37 @@ open class LocationToggle(rootManager: RootManager) : BasePrivacyToggle(rootMana
     private fun getEnableCommandsForApi(): List<CommandSet> =
         if (Build.VERSION.SDK_INT >= 29) {
             listOf(
-                CommandSet("settings put secure location_mode 3", description = "High accuracy mode"),
-                CommandSet("settings put secure location_providers_allowed +gps,+network",
-                          description = "Enable GPS and network providers")
+                CommandSet("settings put secure location_mode 3"),
+                CommandSet("settings put secure location_providers_allowed +gps,+network")
             )
         } else {
             listOf(
-                CommandSet("settings put secure location_providers_allowed +gps && settings put secure location_providers_allowed +network",
-                          description = "Enable GPS and network providers")
+                CommandSet("settings put secure location_providers_allowed +gps && settings put secure location_providers_allowed +network")
             )
         }
 
     private fun getDisableCommandsForApi(): List<CommandSet> =
         if (Build.VERSION.SDK_INT >= 29) {
             listOf(
-                CommandSet("settings put secure location_mode 0", description = "Disable location"),
-                CommandSet("settings put secure location_providers_allowed ''",
-                          description = "Clear location providers")
+                CommandSet("settings put secure location_mode 0"),
+                CommandSet("settings put secure location_providers_allowed ''")
             )
         } else {
             listOf(
-                CommandSet("settings put secure location_providers_allowed -gps && settings put secure location_providers_allowed -network",
-                          description = "Disable GPS and network providers")
+                CommandSet("settings put secure location_providers_allowed -gps && settings put secure location_providers_allowed -network")
             )
         }
 
     private fun getStatusCommandsForApi(): List<CommandSet> =
         if (Build.VERSION.SDK_INT >= 29) {
             listOf(
-                CommandSet("settings get secure location_mode", description = "Check location mode"),
-                CommandSet("settings get secure location_providers_allowed", description = "Check providers"),
-                CommandSet("dumpsys location | grep 'Location'", description = "Dumpsys method")
+                CommandSet("settings get secure location_mode"),
+                CommandSet("settings get secure location_providers_allowed"),
+                CommandSet("dumpsys location | grep 'Location'")
             )
         } else {
             listOf(
-                CommandSet("settings get secure location_providers_allowed", description = "Check providers")
+                CommandSet("settings get secure location_providers_allowed")
             )
         }
 

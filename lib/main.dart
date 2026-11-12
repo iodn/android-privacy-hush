@@ -92,6 +92,7 @@ class _HushAppState extends State<HushApp> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     widget.controller.addListener(_onChanged);
     widget.controller.refresh();
+    unawaited(widget.controller.updates.check(automatic: true));
     _startTimer();
   }
 
@@ -120,6 +121,7 @@ class _HushAppState extends State<HushApp> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       widget.controller.refresh();
+      unawaited(widget.controller.updates.check(automatic: true));
       _startTimer();
     } else {
       timer?.cancel();

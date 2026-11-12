@@ -51,7 +51,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
     public override fun onServiceConnected() {
         super.onServiceConnected()
         isServiceRunning = true
-        Log.i(TAG, "✅ Accessibility Service connected and active")
+        Log.i(TAG, "Accessibility Service connected and active")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -87,7 +87,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
                 // app's own screen ever false-triggers this, the package name here is what would
                 // actually identify it - without this, a false-positive report would be very
                 // hard to track down to its cause.
-                Log.d(TAG, "🔒 Lock screen detected via Accessibility (class: $className, package: ${event.packageName}, isKeyguardLocked=${keyguardManager?.isKeyguardLocked})")
+                Log.d(TAG, "Lock screen detected via Accessibility (class: $className, package: ${event.packageName}, isKeyguardLocked=${keyguardManager?.isKeyguardLocked})")
                 // Only the FIRST keyguard window of a lock cycle arms it. A lock screen emits
                 // several (bouncer, PIN pad, shade pulled down on it), and each re-trigger
                 // REPLACE-cancelled the job waiting out the user's lock delay and restarted that
@@ -95,7 +95,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
                 val alreadyArmed = wasShowingKeyguard
                 wasShowingKeyguard = true
                 if (alreadyArmed) {
-                    Log.d(TAG, "🔒 Already armed for this lock - not restarting the lock delay")
+                    Log.d(TAG, "Already armed for this lock - not restarting the lock delay")
                 } else {
                     triggerEarlyPrivacyActions()
                 }
@@ -113,7 +113,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
                     Log.d(TAG, "Window changed (class: $className) but keyguard is still locked - not an unlock, staying armed")
                     scheduleUnlockRecheck()
                 } else {
-                    Log.d(TAG, "🔓 Lock screen replaced by another window (class: $className), keyguard confirmed unlocked")
+                    Log.d(TAG, "Lock screen replaced by another window (class: $className), keyguard confirmed unlocked")
                     wasShowingKeyguard = false
                     triggerEarlyUnlockActions()
                 }
@@ -148,7 +148,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
             }
             val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
             if (keyguardManager?.isKeyguardLocked == false) {
-                Log.d(TAG, "🔓 Keyguard caught up on delayed re-check (#A3) - no further window event ever arrived to trigger it naturally")
+                Log.d(TAG, "Keyguard caught up on delayed re-check (#A3) - no further window event ever arrived to trigger it naturally")
                 wasShowingKeyguard = false
                 triggerEarlyUnlockActions()
             }
@@ -190,7 +190,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
             if (PrivacyActionWorker.sensorDisableInProgress) {
                 // Another trigger for this same lock is already disabling sensors right now -
                 // REPLACE would cancel it mid-flight. Nothing to gain by racing it.
-                Log.d(TAG, "⏳ Sensor disable already in progress - not enqueuing a duplicate")
+                Log.d(TAG, "Sensor disable already in progress - not enqueuing a duplicate")
                 return
             }
 
@@ -203,7 +203,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
             )
 
 
-            Log.i(TAG, "✅ Early privacy actions triggered (unique work: privacy_action_lock)")
+            Log.i(TAG, "Early privacy actions triggered (unique work: privacy_action_lock)")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to trigger early privacy actions", e)
@@ -236,7 +236,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
             // those are still correct and safe to do even when the enqueue itself is about to be
             // skipped as redundant.
             if (PrivacyActionWorker.sensorEnableInProgress) {
-                Log.d(TAG, "⏳ Sensor enable already in progress - not enqueuing a duplicate")
+                Log.d(TAG, "Sensor enable already in progress - not enqueuing a duplicate")
                 return
             }
 
@@ -248,7 +248,7 @@ class PrivacyAccessibilityService : AccessibilityService() {
                 reason = "Early Unlock Detection (Accessibility)"
             )
 
-            Log.i(TAG, "✅ Early unlock actions triggered (unique work: privacy_action_unlock)")
+            Log.i(TAG, "Early unlock actions triggered (unique work: privacy_action_unlock)")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to trigger early unlock actions", e)
@@ -262,6 +262,6 @@ class PrivacyAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
-        Log.i(TAG, "❌ Accessibility Service destroyed")
+        Log.i(TAG, "Accessibility Service destroyed")
     }
 }

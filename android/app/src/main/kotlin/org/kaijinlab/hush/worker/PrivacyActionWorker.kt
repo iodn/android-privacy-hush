@@ -35,6 +35,11 @@ open class PrivacyActionWorker(
     companion object {
         private const val TAG = "hush-PrivacyActionWorker"
 
+        // The backends whose route can still switch camera/mic while a PIN lock is up: root
+        // executes directly and Dhizuku goes through device policy. Set, not per-call literal,
+        // so the membership lives in one place.
+        private val SENSOR_CAPABLE_METHODS = setOf(PrivilegeMethod.DHIZUKU, PrivilegeMethod.ROOT)
+
         internal val usageAccessWarningLogged = java.util.concurrent.atomic.AtomicBoolean(false)
 
         // True from the start of a lock-direction doWork() invocation until that invocation's
@@ -229,7 +234,7 @@ open class PrivacyActionWorker(
         if (!foregroundAppDetector.exemptAppsNeedUsageAccess(exemptApps)) {
             usageAccessWarningLogged.set(false)
         } else if (usageAccessWarningLogged.compareAndSet(false, true)) {
-            logWarning("⚠️ Usage Access is not granted - exempt apps cannot be detected (logged once until it changes)")
+            logWarning("Usage Access is not granted - exempt apps cannot be detected (logged once until it changes)")
         }
         return foregroundAppDetector.getFirstForegroundApp(exemptApps)
     }
@@ -292,7 +297,7 @@ open class PrivacyActionWorker(
                 val inUse = isFeatureInUse(feature)
                 if (inUse) {
                     val detail = inUseDetail(feature)?.let { " ($it)" }.orEmpty()
-                    logDebug("⏸️ ${feature.displayName} is in use$detail - skipping disable (onlyIfUnused=true)")
+                    logDebug("${feature.displayName} is in use$detail - skipping disable (onlyIfUnused=true)")
                     debugNotifier.notifyFeatureSkipped(feature.displayName, "in use/connected")
                 }
                 !inUse // Only include if NOT in use
@@ -302,15 +307,13 @@ open class PrivacyActionWorker(
 
     protected open fun actionTimeMillis(): Long = android.os.SystemClock.elapsedRealtime()
 
-    protected open suspend fun awaitFeatureDelay(millis: Long) { waitWithCountdown(millis) }
-
     private suspend fun waitWithCountdown(millis: Long) {
         if (!preferenceManager.showCountdown || !org.kaijinlab.hush.service.PrivacyMonitorService.isRunning()) {
             delay(millis)
             return
         }
         val locking = inputData.getBoolean(PrivacyActionWork.KEY_IS_LOCKING, false)
-        val until = System.nanoTime() + millis * 1_000_000L
+        val until = actionTimeMillis() + millis
         try {
             var remaining = millis
             while (remaining > 0) {
@@ -319,7 +322,7 @@ open class PrivacyActionWorker(
                 } else null
                 org.kaijinlab.hush.service.PrivacyMonitorService.showCountdown(id, text)
                 delay(minOf(1000L, remaining))
-                remaining = maxOf(0L, (until - System.nanoTime() + 999_999L) / 1_000_000L)
+                remaining = maxOf(0L, until - actionTimeMillis())
             }
         } finally {
             org.kaijinlab.hush.service.PrivacyMonitorService.showCountdown(id, null)
@@ -330,7 +333,13 @@ open class PrivacyActionWorker(
         org.kaijinlab.hush.util.DeferredActionWork.enqueue(applicationContext, features, locking, delayMillis, generation)
     }
 
-    override suspend fun doWork(): Result {
+    override suspend fun doWork(): Result = try {
+        performWork()
+    } finally {
+        org.kaijinlab.hush.util.DeferredActionWork.releaseWakeLock(id)
+    }
+
+    private suspend fun performWork(): Result {
         val deferred = org.kaijinlab.hush.util.DeferredActionWork
         inputData.getString(deferred.KEY_FEATURES)?.let { names ->
             val features = names.split(',').mapNotNull { name -> PrivacyFeature.values().firstOrNull { it.name == name } }.toSet()
@@ -352,53 +361,36 @@ open class PrivacyActionWorker(
         if (inputData.getString(PrivacyActionWork.KEY_TRIGGER) == PrivacyActionWork.TRIGGER_REBLOCK) {
             // An already-due control may need correction while another control still awaits its timer.
             // Never bring that later control forward as a side effect of reblocking the first one.
-            val ready = if (preferenceManager.hasCustomFeatureDelays(true) || preferenceManager.lockDelaySeconds > 300) PrivacyFeature.values().filter {
+            val ready = if (PrivacyActionWork.usesSplitReblock(preferenceManager)) PrivacyFeature.values().filter {
                 if (it in PrivacyFeature.getSystemModeFeatures()) preferenceManager.getFeatureEnabledByApp(it)
                 else it in preferenceManager.featuresOffSinceUnlock
             }.toSet() else null
             return executeAction(ready)
         }
         if (locking && !preferenceManager.isGlobalPrivacyEnabled) return executeAction()
-        val configured = PrivacyFeature.values().filter {
-            if (locking) preferenceManager.getFeatureDisableOnLock(it)
-            else preferenceManager.getFeatureEnableOnUnlock(it)
-        }.let {
-            if (locking || preferenceManager.isGlobalPrivacyEnabled) it
-            else restoredWithProtectionOff(it, preferenceManager.featuresOffSinceUnlock)
+        val configured = PrivacyActionWork.configuredFeatures(preferenceManager, locking)
+        if (configured.all { preferenceManager.getFeatureDelaySeconds(it, locking) == 0 }) return executeAction()
+        val now = actionTimeMillis()
+        val startedAt = inputData.getLong(PrivacyActionWork.KEY_TRIGGERED_AT, now).let {
+            if (it in 0..now) it else now
         }
-        if (configured.none { preferenceManager.getFeatureDelayOverride(it, locking) != null } &&
-            configured.all { preferenceManager.getFeatureDelaySeconds(it, locking) <= 300 }) {
-            return executeAction()
-        }
-        val startedAt = actionTimeMillis()
         val groups = configured.groupBy { preferenceManager.getFeatureDelaySeconds(it, locking) }.toSortedMap()
         if (locking && inputData.getString(PrivacyActionWork.KEY_TRIGGER) != PrivacyActionWork.TRIGGER_SERVICE_INIT) {
             preferenceManager.sensorsLeftOnAtLastLock = emptySet()
         }
-        // WorkManager workers have a ten-minute execution limit. Longer timers live in its
-        // persistent scheduler, so they survive the UI closing or this process being reclaimed.
-        var deferredRegistered = false
-        fun registerLongTimers() {
-            if (deferredRegistered) return
-            val generation = deferred.generationForState(applicationContext, locking) ?: return
-            for ((seconds, features) in groups.filterKeys { it > 300 }) {
-                deferFeatures(features.toSet(), locking, maxOf(0L, startedAt + seconds * 1000L - actionTimeMillis()), generation)
-            }
-            deferredRegistered = true
-        }
-        for ((seconds, features) in groups.filterKeys { it <= 300 }) {
-            // Do not put database work ahead of immediate camera/microphone protection.
-            if (seconds > 0) registerLongTimers()
-            val remaining = startedAt + seconds * 1000L - actionTimeMillis()
-            if (remaining > 0) awaitFeatureDelay(remaining)
+        // Apply immediate sensor protection first; every positive delay uses a wake-up timer.
+        for ((seconds, features) in groups) {
             val superseded = if (locking) isSupersededByFresherOppositeAction(lastUnlockAtMillis, lastLockAtMillis)
                 else isSupersededByFresherOppositeAction(lastLockAtMillis, lastUnlockAtMillis)
             if (superseded || (locking && !preferenceManager.isGlobalPrivacyEnabled)) return Result.success()
-            if (seconds > 0 && isScreenCurrentlyLocked() != locking) return Result.success()
-            val result = timedActionMutex.withLock { executeAction(features.toSet()) }
-            if (result != Result.success()) return result
+            if (seconds > 0) {
+                val generation = deferred.generationForState(applicationContext, locking) ?: return Result.success()
+                deferFeatures(features.toSet(), locking, maxOf(0L, startedAt + seconds * 1000L - actionTimeMillis()), generation)
+            } else {
+                val result = timedActionMutex.withLock { executeAction(features.toSet()) }
+                if (result != Result.success()) return result
+            }
         }
-        registerLongTimers()
         return Result.success()
     }
 
@@ -441,7 +433,7 @@ open class PrivacyActionWorker(
             val isUserLock = isLocking && trigger != PrivacyActionWork.TRIGGER_SERVICE_INIT && !isReblock
             if (isUserLock && allowedFeatures == null) preferenceManager.sensorsLeftOnAtLastLock = emptySet()
 
-            logDebug("🔒 Executing privacy actions: locking=$isLocking, deviceLocked=$isDeviceLocked, trigger=$trigger, reason=$reason")
+            logDebug("Executing privacy actions: locking=$isLocking, deviceLocked=$isDeviceLocked, trigger=$trigger, reason=$reason")
 
             // Works for Root, Dhizuku, Shizuku and Sui.
             val hasPrivilege = confirmPrivilege()
@@ -461,7 +453,7 @@ open class PrivacyActionWorker(
 
             val isGlobalPrivacyEnabled = preferenceManager.isGlobalPrivacyEnabled
             if (!isGlobalPrivacyEnabled && isLocking) {
-                logDebug("🚫 Global privacy is disabled - skipping all privacy actions")
+                logDebug("Global privacy is disabled - skipping all privacy actions")
                 debugNotifier.notifyGlobalPrivacyDisabled()
                 return Result.success()
             }
@@ -478,7 +470,7 @@ open class PrivacyActionWorker(
                 }
 
                 if (foregroundExemptApp != null) {
-                    logDebug("🛡️ Exempt app '$foregroundExemptApp' was in front at lock - not disabling anything")
+                    logDebug("Exempt app '$foregroundExemptApp' was in front at lock - not disabling anything")
                     debugNotifier.notifyFeatureSkipped("All features", "exempt app was in front at lock: $foregroundExemptApp")
                     return Result.success()
                 }
@@ -524,7 +516,7 @@ open class PrivacyActionWorker(
 
                     // Camera/mic go first, with no delay, and are skipped only where Android refuses them:
                     // a PIN, pattern or password lock, on the sensor-privacy route (Dhizuku uses device policy).
-                    val lockRefusesSensors = privilegeMethod() !in setOf(PrivilegeMethod.DHIZUKU, PrivilegeMethod.ROOT)
+                    val lockRefusesSensors = privilegeMethod() !in SENSOR_CAPABLE_METHODS
                     if (sensorFeatures.isNotEmpty()) {
                       val filteredSensorFeatures = filterByOnlyIfUnused(sensorFeatures, hotspotActiveNow = false)
                       if (filteredSensorFeatures.isNotEmpty()) {
@@ -539,21 +531,21 @@ open class PrivacyActionWorker(
                           // already ran or is queued right behind this check - disabling now
                           // would stomp on it.
                           if (isSupersededByFresherOppositeAction(lastUnlockAtMillis, lastLockAtMillis)) {
-                              logDebug("⚠️ A newer unlock was recorded since this lock - skipping sensor disable")
+                              logDebug("A newer unlock was recorded since this lock - skipping sensor disable")
                               debugNotifier.notifyFeatureSkipped(
                                   filteredSensorFeatures.map { it.displayName }.joinToString(", "),
                                   "unlocked since this lock cycle started"
                               )
                           } else if (!lockRefusesSensors || (!isDeviceLocked && !isDeviceSecurelyLocked())) {
-                              logDebug("🔒 Attempting to disable sensors immediately (no delay): ${filteredSensorFeatures.map { it.displayName }}")
+                              logDebug("Attempting to disable sensors immediately (no delay): ${filteredSensorFeatures.map { it.displayName }}")
                               val sensorResults = disableFeatures(filteredSensorFeatures.toSet())
-                              processResults(sensorResults, filteredSensorFeatures, "🔒", "disabled", "Disabled", isLockCycle = true, didEnable = false)
+                              processResults(sensorResults, filteredSensorFeatures, "Lock:", "disabled", "Disabled", isLockCycle = true, didEnable = false)
                               recordTurnedOff(sensorResults)
                               val stillFailed = sensorResults.filter { !it.success }
                               if (stillFailed.isNotEmpty()) {
                                   if (isUserLock) preferenceManager.sensorsLeftOnAtLastLock += stillFailed.map { it.feature }
                                   // processResults already reported it; a second "skipped" message would contradict that.
-                                  logWarning("⚠️ Sensor disable did not take effect: ${stillFailed.map { it.feature.displayName }}")
+                                  logWarning("Sensor disable did not take effect: ${stillFailed.map { it.feature.displayName }}")
                               }
                           } else {
                               // A second job for the same lock can find them already off; unreadable counts as still on.
@@ -563,9 +555,9 @@ open class PrivacyActionWorker(
                               }
                               if (isUserLock) preferenceManager.sensorsLeftOnAtLastLock += stillOn
                               if (stillOn.isEmpty()) {
-                                  logDebug("🔒 Sensors were already off when this trigger arrived - nothing to disable")
+                                  logDebug("Sensors were already off when this trigger arrived - nothing to disable")
                               } else {
-                                  logWarning("⚠️ Device already locked - cannot disable sensors: ${stillOn.map { it.displayName }}")
+                                  logWarning("Device already locked - cannot disable sensors: ${stillOn.map { it.displayName }}")
                                   debugNotifier.notifyFeatureSkipped(
                                       stillOn.map { it.displayName }.joinToString(", "),
                                       "device already locked"
@@ -588,9 +580,9 @@ open class PrivacyActionWorker(
 
                     // Handle regular features and protection modes after delay
                     if (regularFeatures.isNotEmpty() || protectionModes.isNotEmpty()) {
-                        logDebug("📍 CHECKPOINT: Entering regular features/protection modes block")
-                        logDebug("📊 regularFeatures count: ${regularFeatures.size}, protectionModes count: ${protectionModes.size}")
-                        logDebug("📊 regularFeatures: ${regularFeatures.map { it.displayName }}")
+                        logDebug("CHECKPOINT: Entering regular features/protection modes block")
+                        logDebug("regularFeatures count: ${regularFeatures.size}, protectionModes count: ${protectionModes.size}")
+                        logDebug("regularFeatures: ${regularFeatures.map { it.displayName }}")
 
                         // Always honour the user's configured delay, even if the device is
                         // already locked by the time this job runs. Most phones lock instantly on
@@ -600,25 +592,25 @@ open class PrivacyActionWorker(
                         // if the user unlocks again during the wait.
                         val lockDelay = if (isReblock || allowedFeatures != null) 0 else preferenceManager.lockDelaySeconds
 
-                        logDebug("⏱️ Lock delay: ${lockDelay}s (isDeviceLocked=$isDeviceLocked, trigger=$trigger)")
+                        logDebug("Lock delay: ${lockDelay}s (isDeviceLocked=$isDeviceLocked, trigger=$trigger)")
 
                         if (lockDelay > 0) {
-                            logDebug("⏳ Waiting ${lockDelay}s before disabling other features")
+                            logDebug("Waiting ${lockDelay}s before disabling other features")
                             waitWithCountdown(lockDelay * 1000L)
 
-                            logDebug("⏱️ Delay completed, now validating screen state...")
+                            logDebug("Delay completed, now validating screen state...")
 
                             // Validate screen is still locked after delay
                             val isStillLocked = isScreenCurrentlyLocked()
-                            logDebug("🔍 Screen lock validation: isStillLocked=$isStillLocked")
+                            logDebug("Screen lock validation: isStillLocked=$isStillLocked")
 
                             if (!isStillLocked) {
-                                logWarning("⚠️ Screen is no longer locked after delay - cancelling disable action")
+                                logWarning("Screen is no longer locked after delay - cancelling disable action")
                                 try {
                                     val km = applicationContext.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
                                     val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
-                                    logWarning("🔍 KeyguardManager.isKeyguardLocked: ${km.isKeyguardLocked}")
-                                    logWarning("🔍 PowerManager.isInteractive: ${pm.isInteractive}")
+                                    logWarning("KeyguardManager.isKeyguardLocked: ${km.isKeyguardLocked}")
+                                    logWarning("PowerManager.isInteractive: ${pm.isInteractive}")
                                 } catch (e: Exception) {
                                     logError("Error logging lock state details", e)
                                 }
@@ -626,19 +618,19 @@ open class PrivacyActionWorker(
                                 return Result.success()
                             }
 
-                            logDebug("🔍 Checking global privacy setting...")
+                            logDebug("Checking global privacy setting...")
 
                             // Re-check global privacy setting after delay
                             val isGlobalPrivacyStillEnabled = preferenceManager.isGlobalPrivacyEnabled
-                            logDebug("🔍 Global privacy enabled: $isGlobalPrivacyStillEnabled")
+                            logDebug("Global privacy enabled: $isGlobalPrivacyStillEnabled")
 
                             if (!isGlobalPrivacyStillEnabled) {
-                                logDebug("🚫 Global privacy disabled during delay - cancelling disable action")
+                                logDebug("Global privacy disabled during delay - cancelling disable action")
                                 debugNotifier.notifyActionCancelled("Global privacy disabled during delay")
                                 return Result.success()
                             }
                         } else {
-                            logDebug("⚡ Skipping delay (lockDelay=0), proceeding directly to disable features")
+                            logDebug("Skipping delay (lockDelay=0), proceeding directly to disable features")
                         }
 
                         // Catches an unlock that this cycle's own sensor block above deliberately
@@ -652,12 +644,12 @@ open class PrivacyActionWorker(
                         // here, not a value frozen at this job's own start - see
                         // isSupersededByFresherOppositeAction's comment above.
                         if (isSupersededByFresherOppositeAction(lastUnlockAtMillis, lastLockAtMillis)) {
-                            logWarning("⚠️ Unlocked since this lock - cancelling remaining disable actions")
+                            logWarning("Unlocked since this lock - cancelling remaining disable actions")
                             debugNotifier.notifyActionCancelled("Unlocked during lock cycle - disable cancelled")
                             return Result.success()
                         }
 
-                        logDebug("📍 CHECKPOINT: Passed all validations, proceeding to disable features")
+                        logDebug("CHECKPOINT: Passed all validations, proceeding to disable features")
 
                         // Re-check hotspot state once, here - the latest safe moment for WiFi and
                         // Mobile Data, rather than a pre-delay sample plus a post-delay
@@ -684,7 +676,7 @@ open class PrivacyActionWorker(
                                 if (PrivacyFeature.MOBILE_DATA in regularFeatures) add("Mobile Data")
                             }
                             if (keptOn.isNotEmpty()) {
-                                logDebug("📡 Hotspot is active - keeping ${keptOn.joinToString(", ")} on despite lock")
+                                logDebug("Hotspot is active - keeping ${keptOn.joinToString(", ")} on despite lock")
                                 debugNotifier.notifyFeatureSkipped(keptOn.joinToString(", "), "hotspot is active")
                             }
                         }
@@ -699,17 +691,17 @@ open class PrivacyActionWorker(
                             val filteredRegularFeatures = filterByOnlyIfUnused(regularFeatures, hotspotActiveNow)
 
                             if (filteredRegularFeatures.isNotEmpty()) {
-                                logDebug("🔒 Disabling regular features (count=${filteredRegularFeatures.size}): ${filteredRegularFeatures.map { it.displayName }}")
+                                logDebug("Disabling regular features (count=${filteredRegularFeatures.size}): ${filteredRegularFeatures.map { it.displayName }}")
                                 val stateBefore = stateBeforeForDebugOutput()
                                 // The read is a slow shell round-trip, so an unlock it overlapped is checked for again.
                                 if (stateBefore != null && isSupersededByFresherOppositeAction(lastUnlockAtMillis, lastLockAtMillis)) {
-                                    logWarning("⚠️ Unlocked while reading states - cancelling remaining disable actions")
+                                    logWarning("Unlocked while reading states - cancelling remaining disable actions")
                                     debugNotifier.notifyActionCancelled("Unlocked during lock cycle - disable cancelled")
                                     return Result.success()
                                 }
                                 val regularResults = disableFeatures(filteredRegularFeatures.toSet())
 
-                                logDebug("🔒 disableFeatures() returned ${regularResults.size} results")
+                                logDebug("disableFeatures() returned ${regularResults.size} results")
 
                                 val outcomes = regularResults.associate {
                                     it.feature to lockOutcome(stateBefore?.get(it.feature), it.success, isReblock)
@@ -718,21 +710,21 @@ open class PrivacyActionWorker(
                                     stateBefore == null || outcomes[it.feature] !in REPORTED_ON_THEIR_OWN
                                 }
                                 if (plainResults.isNotEmpty()) {
-                                    processResults(plainResults, plainResults.map { it.feature }, "🔒", "disabled", "Disabled", isLockCycle = true, didEnable = false)
+                                    processResults(plainResults, plainResults.map { it.feature }, "Lock:", "disabled", "Disabled", isLockCycle = true, didEnable = false)
                                 }
                                 if (stateBefore != null) reportLockOutcomes(outcomes)
                                 recordTurnedOff(regularResults)
                             } else {
-                                logDebug("ℹ️ No regular features left to disable after the in-use/hotspot check")
+                                logDebug("No regular features left to disable after the in-use/hotspot check")
                             }
                         } else {
-                            logDebug("ℹ️ No regular features to disable (list is empty)")
+                            logDebug("No regular features to disable (list is empty)")
                         }
 
                         // ENABLE protection modes (Airplane Mode, Battery Saver) - note: ENABLE, not disable!
                         // Also track whether we enabled them (for "only if not manually set" feature)
                         if (protectionModes.isNotEmpty()) {
-                            logDebug("🛡️ Enabling protection modes on lock: ${protectionModes.map { it.displayName }}")
+                            logDebug("Enabling protection modes on lock: ${protectionModes.map { it.displayName }}")
 
                             // Get current status to check if already enabled
                             val currentStatus = getCurrentStatus()
@@ -753,7 +745,7 @@ open class PrivacyActionWorker(
                             // it would otherwise put the phone into Airplane Mode while it is back
                             // in the user's hands.
                             if (isSupersededByFresherOppositeAction(lastUnlockAtMillis, lastLockAtMillis)) {
-                                logWarning("🛡️ Unlocked while this lock was still running - not enabling protection modes")
+                                logWarning("Unlocked while this lock was still running - not enabling protection modes")
                                 debugNotifier.notifyActionCancelled("Unlocked during the lock action - protection modes not enabled")
                                 return Result.success()
                             }
@@ -774,7 +766,7 @@ open class PrivacyActionWorker(
                                     // above - so what the user is told always matches what the
                                     // code actually does, even if hotspot state changed between
                                     // the two checks.
-                                    logDebug("🛡️ Skipping Airplane Mode - hotspot is active")
+                                    logDebug("Skipping Airplane Mode - hotspot is active")
                                     debugNotifier.notifyFeatureSkipped("Airplane Mode", "hotspot is active")
                                     continue
                                 }
@@ -791,9 +783,9 @@ open class PrivacyActionWorker(
                                     // ownership is left exactly as it was: disowning it here is
                                     // what used to make a failed unlock-disable permanent.
                                     if (ownedNow) {
-                                        logDebug("🛡️ ${mode.displayName} already enabled and still owned by this app - keeping it owned")
+                                        logDebug("${mode.displayName} already enabled and still owned by this app - keeping it owned")
                                     } else {
-                                        logDebug("🛡️ ${mode.displayName} already enabled, and not by this app - skipping")
+                                        logDebug("${mode.displayName} already enabled, and not by this app - skipping")
                                         debugNotifier.notifyFeatureSkipped(mode.displayName, "already enabled")
                                     }
                                 } else {
@@ -801,11 +793,11 @@ open class PrivacyActionWorker(
                                     val success = results.firstOrNull()?.success == true
                                     if (ownershipAfterEnabling(observedState, success)) {
                                         preferenceManager.setFeatureEnabledByApp(mode, true)
-                                        logDebug("🛡️ ${mode.displayName} enabled by app")
+                                        logDebug("${mode.displayName} enabled by app")
                                     } else if (success) {
-                                        logWarning("🛡️ ${mode.displayName} was switched on, but its state could not be read first - leaving it unclaimed so the next unlock cannot undo a setting of yours")
+                                        logWarning("${mode.displayName} was switched on, but its state could not be read first - leaving it unclaimed so the next unlock cannot undo a setting of yours")
                                     }
-                                    processResults(results, listOf(mode), "🛡️", "enabled", "Enabled", isLockCycle = true, didEnable = true)
+                                    processResults(results, listOf(mode), "Protection:", "enabled", "Enabled", isLockCycle = true, didEnable = true)
                                 }
                             }
                         }
@@ -867,7 +859,7 @@ open class PrivacyActionWorker(
                               } else {
                                   val isAlreadyEnabled = currentSensorStatus[feature] == FeatureState.ENABLED
                                   if (isAlreadyEnabled) {
-                                      logDebug("⏸️ ${feature.displayName} already enabled - skipping enable (onlyIfNotEnabled=true)")
+                                      logDebug("${feature.displayName} already enabled - skipping enable (onlyIfNotEnabled=true)")
                                   }
                                   !isAlreadyEnabled
                               }
@@ -878,17 +870,17 @@ open class PrivacyActionWorker(
                           // with a stale instruction.
                           if (filteredSensorFeatures.isNotEmpty() &&
                               isSupersededByFresherOppositeAction(lastLockAtMillis, lastUnlockAtMillis)) {
-                              logDebug("⚠️ A newer lock was recorded since this unlock - skipping sensor enable")
+                              logDebug("A newer lock was recorded since this unlock - skipping sensor enable")
                               notRestored += filteredSensorFeatures
                               debugNotifier.notifyFeatureSkipped(
                                   filteredSensorFeatures.map { it.displayName }.joinToString(", "),
                                   "locked since this unlock cycle started"
                               )
                           } else if (filteredSensorFeatures.isNotEmpty()) {
-                              logDebug("⚡ Enabling sensors immediately (no delay): ${filteredSensorFeatures.map { it.displayName }}")
+                              logDebug("Enabling sensors immediately (no delay): ${filteredSensorFeatures.map { it.displayName }}")
                               val sensorResults = enableFeatures(filteredSensorFeatures.toSet())
                               notRestored += sensorResults.filter { !it.success }.map { it.feature }
-                              processResults(sensorResults, filteredSensorFeatures, "🔓", "enabled", "Re-enabled", isLockCycle = false, didEnable = true)
+                              processResults(sensorResults, filteredSensorFeatures, "Unlock:", "enabled", "Re-enabled", isLockCycle = false, didEnable = true)
                           }
                         }
                     }
@@ -902,18 +894,18 @@ open class PrivacyActionWorker(
                     if (regularFeatures.isNotEmpty() || protectionModes.isNotEmpty()) {
                         val unlockDelay = if (allowedFeatures != null) 0 else preferenceManager.unlockDelaySeconds
                         if (unlockDelay > 0) {
-                            logDebug("⏳ Waiting ${unlockDelay}s before enabling other features")
+                            logDebug("Waiting ${unlockDelay}s before enabling other features")
                             waitWithCountdown(unlockDelay * 1000L)
 
                             // Validate screen is still unlocked after delay
                             if (isScreenCurrentlyLocked()) {
-                                logWarning("⚠️ Screen is locked again after delay - cancelling enable action")
+                                logWarning("Screen is locked again after delay - cancelling enable action")
                                 debugNotifier.notifyActionCancelled("Screen locked during delay - enable cancelled")
                                 return Result.success()
                             }
 
                             if (!preferenceManager.isGlobalPrivacyEnabled) {
-                                logDebug("🚫 Global privacy disabled during delay - restoring only what this app turned off")
+                                logDebug("Global privacy disabled during delay - restoring only what this app turned off")
                                 regularFeatures = restoredWithProtectionOff(regularFeatures, offSinceLastUnlock)
                                 protectionModes = restoredWithProtectionOff(protectionModes, offSinceLastUnlock)
                             }
@@ -930,7 +922,7 @@ open class PrivacyActionWorker(
                         // value frozen at this job's own start - see
                         // isSupersededByFresherOppositeAction's comment above.
                         if (isSupersededByFresherOppositeAction(lastLockAtMillis, lastUnlockAtMillis)) {
-                            logWarning("⚠️ Locked since this unlock - cancelling remaining enable actions")
+                            logWarning("Locked since this unlock - cancelling remaining enable actions")
                             debugNotifier.notifyActionCancelled("Locked during unlock cycle - enable cancelled")
                             return Result.success()
                         }
@@ -950,7 +942,7 @@ open class PrivacyActionWorker(
                                     val isAlreadyEnabled = currentState == FeatureState.ENABLED
 
                                     if (isAlreadyEnabled) {
-                                        logDebug("⏸️ ${feature.displayName} already enabled - skipping enable (onlyIfNotEnabled=true)")
+                                        logDebug("${feature.displayName} already enabled - skipping enable (onlyIfNotEnabled=true)")
                                         debugNotifier.notifyFeatureSkipped(feature.displayName, "already enabled")
                                     }
                                     !isAlreadyEnabled // Only include if NOT already enabled
@@ -958,24 +950,24 @@ open class PrivacyActionWorker(
                             }
 
                             if (filteredRegularFeatures.isNotEmpty()) {
-                                logDebug("🔓 Enabling regular features: ${filteredRegularFeatures.map { it.displayName }}")
+                                logDebug("Enabling regular features: ${filteredRegularFeatures.map { it.displayName }}")
                                 val regularResults = enableFeatures(filteredRegularFeatures.toSet())
                                 notRestored += regularResults.filter { !it.success }.map { it.feature }
-                                processResults(regularResults, filteredRegularFeatures, "🔓", "enabled", "Re-enabled", isLockCycle = false, didEnable = true)
+                                processResults(regularResults, filteredRegularFeatures, "Unlock:", "enabled", "Re-enabled", isLockCycle = false, didEnable = true)
                             }
                         }
 
                         // DISABLE protection modes (Airplane Mode, Battery Saver) - note: DISABLE, not enable!
                         // Check "only if not manually set" preference before disabling
                         if (protectionModes.isNotEmpty()) {
-                            logDebug("🛡️ Disabling protection modes on unlock: ${protectionModes.map { it.displayName }}")
+                            logDebug("Disabling protection modes on unlock: ${protectionModes.map { it.displayName }}")
 
                             // The mirror of the lock-side guard. Read fresh, immediately before
                             // switching a radio kill-switch OFF: the enable step above makes real
                             // shell calls, and a re-lock during it would otherwise let this stale
                             // unlock undo protection on a phone that is locked right now.
                             if (isSupersededByFresherOppositeAction(lastLockAtMillis, lastUnlockAtMillis)) {
-                                logWarning("🛡️ Locked again while this unlock was still running - leaving protection modes alone")
+                                logWarning("Locked again while this unlock was still running - leaving protection modes alone")
                                 debugNotifier.notifyActionCancelled("Locked during the unlock action - protection modes left on")
                                 return Result.success()
                             }
@@ -986,7 +978,7 @@ open class PrivacyActionWorker(
 
                                 if (onlyIfNotManual && !wasEnabledByApp) {
                                     // Unowned is not proof the user set it: a lock that could not read the state never claims it.
-                                    logDebug("🛡️ ${mode.displayName} was not turned on by Hush - skipping disable (onlyIfNotManual=true)")
+                                    logDebug("${mode.displayName} was not turned on by Hush - skipping disable (onlyIfNotManual=true)")
                                     debugNotifier.notifyFeatureSkipped(mode.displayName, "not turned on by Hush")
                                 } else {
                                     // Either "only if not manually set" is disabled, or we enabled it
@@ -999,9 +991,9 @@ open class PrivacyActionWorker(
                                     if (allSucceeded(results)) {
                                         preferenceManager.setFeatureEnabledByApp(mode, false)
                                     } else {
-                                        logWarning("🛡️ ${mode.displayName} did not turn off - keeping it marked as set by this app so the next unlock tries again")
+                                        logWarning("${mode.displayName} did not turn off - keeping it marked as set by this app so the next unlock tries again")
                                     }
-                                    processResults(results, listOf(mode), "🛡️", "disabled", "Disabled", isLockCycle = false, didEnable = false)
+                                    processResults(results, listOf(mode), "Protection:", "disabled", "Disabled", isLockCycle = false, didEnable = false)
                                 }
                             }
                         }
@@ -1017,7 +1009,7 @@ open class PrivacyActionWorker(
         } catch (e: kotlinx.coroutines.CancellationException) {
             // Work was cancelled (e.g., screen state changed during delay)
             // This is expected behavior, not an error
-            logDebug("⚠️ Privacy action cancelled (screen state changed)")
+            logDebug("Privacy action cancelled (screen state changed)")
             debugNotifier.notifyActionCancelled("Screen state changed during action")
             throw e // Re-throw to properly cancel the coroutine
         } catch (e: Exception) {
@@ -1095,10 +1087,10 @@ open class PrivacyActionWorker(
         outcomes.forEach { (feature, outcome) ->
             val name = feature.displayName
             when (outcome) {
-                LockOutcome.TURNED_OFF -> logDebug("🔒 $name was on - turned off by Hush")
-                LockOutcome.ALREADY_OFF -> logDebug("⏸️ $name was already off")
-                LockOutcome.FOUND_ON_WHILE_LOCKED -> logWarning("🚨 $name was ON while locked - turned off${sinceSeen(feature)}")
-                LockOutcome.STATE_UNKNOWN -> logDebug("❔ $name switched off - its state before could not be read")
+                LockOutcome.TURNED_OFF -> logDebug("$name was on - turned off by Hush")
+                LockOutcome.ALREADY_OFF -> logDebug("$name was already off")
+                LockOutcome.FOUND_ON_WHILE_LOCKED -> logWarning("$name was ON while locked - turned off${sinceSeen(feature)}")
+                LockOutcome.STATE_UNKNOWN -> logDebug("$name switched off - its state before could not be read")
                 LockOutcome.FAILED -> Unit
             }
         }
@@ -1106,7 +1098,7 @@ open class PrivacyActionWorker(
         if (alreadyOff.isNotEmpty()) debugNotifier.notifyFeatureSkipped(alreadyOff.joinToString(", "), "already off")
         val foundOn = outcomes.filterValues { it == LockOutcome.FOUND_ON_WHILE_LOCKED }.keys
         if (foundOn.isNotEmpty()) {
-            debugNotifier.notify("🚨 Found ON while locked", foundOn.joinToString("; ") { "${it.displayName} - turned off${sinceSeen(it)}" })
+            debugNotifier.notify("Found ON while locked", foundOn.joinToString("; ") { "${it.displayName} - turned off${sinceSeen(it)}" })
         }
     }
 
@@ -1136,7 +1128,7 @@ open class PrivacyActionWorker(
         if (privilegeMethod() == PrivilegeMethod.DHIZUKU) return
         val status = getCurrentStatus()
         notTurnedBackOn.filter { status[it] == FeatureState.ENABLED }.forEach { feature ->
-            logWarning("⚠️ ${feature.displayName} is on at unlock: a lock since the last finished unlock switched it off (its disable reported success), and this app did not switch it back on (Enable on unlock is off)")
+            logWarning("${feature.displayName} is on at unlock: a lock since the last finished unlock switched it off (its disable reported success), and this app did not switch it back on (Enable on unlock is off)")
         }
     }
 
@@ -1153,16 +1145,14 @@ open class PrivacyActionWorker(
         val failedResults = results.filter { !it.success }
 
         results.forEach { result ->
-            val status = if (result.success) "✅ SUCCESS" else "❌ FAILED"
+            val status = if (result.success) "SUCCESS" else "FAILED"
             Log.i(TAG, "$logIcon ${result.feature.displayName}: $status")
         }
 
         Log.i(TAG, "Lock action completed: $successCount/${features.size} features $actionPastTense")
 
         if (successCount > 0) {
-            val successfulFeatures = results.filter { it.success }.map { result ->
-                features.find { it.displayName == result.feature.displayName }?.displayName ?: result.feature.displayName
-            }
+            val successfulFeatures = results.filter { it.success }.map { it.feature.displayName }
             val toastMessage = "$toastPrefix: ${successfulFeatures.joinToString(", ")}"
             showToast(toastMessage)
 

@@ -46,10 +46,12 @@ class DebugLogHelper private constructor(private val context: Context) {
         }
 
         try {
-            val timestamp = dateFormat.format(Date())
-            val logLine = "[$timestamp] [$tag] $message\n"
-
+            // SimpleDateFormat is not thread-safe: format inside the same lock trimLogFile runs
+            // under, or two logging threads can corrupt its shared calendar and produce garbled
+            // timestamps (or throw). The file append was already inside; only the format was not.
             synchronized(this) {
+                val logLine = "[$dateFormat.format(Date())] [$tag] $message\n"
+
                 // Check if we need to trim the log file
                 if (logFile.exists() && logFile.length() > MAX_LOG_SIZE_BYTES) {
                     trimLogFile()
